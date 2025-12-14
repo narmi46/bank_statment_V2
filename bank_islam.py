@@ -1,38 +1,15 @@
-# bank_islam.py - Bank Islam Universal Parser
+# bank_islam.py - Bank Islam (Word-based PDF parser)
 import re
 from datetime import datetime
-
-# ---------------------------------------------------------
-# YEAR EXTRACTION
-# ---------------------------------------------------------
-
-def extract_year_from_text(text):
-    match = re.search(
-        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{2}/\d{2}/(\d{2,4})',
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        y = match.group(1)
-        return y if len(y) == 4 else str(2000 + int(y))
-
-    match = re.search(r'From\s+\d{2}/\d{2}/(\d{4})', text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-
-    return None
-
 
 # ---------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------
 
 def clean_amount(val):
-    if val in (None, "", "-"):
-        return 0.0
     try:
-        return float(str(val).replace(",", "").strip())
-    except ValueError:
+        return float(val.replace(",", ""))
+    except Exception:
         return 0.0
 
 
@@ -41,73 +18,77 @@ def format_date(date_raw, year):
         return datetime.strptime(date_raw, "%d/%m/%y").strftime("%Y-%m-%d")
     except ValueError:
         pass
-
     try:
         return datetime.strptime(date_raw, "%d/%m/%Y").strftime("%Y-%m-%d")
     except ValueError:
         pass
-
     return f"{year}-01-01"
 
 
+def extract_year(text):
+    match = re.search(r"(STATEMENT DATE|TARIKH PENYATA).*(\d{2}/\d{2}/(\d{2,4}))", text)
+    if match:
+        y = match.group(3)
+        return y if len(y) == 4 else str(2000 + int(y))
+    return str(datetime.now().year)
+
+
 # ---------------------------------------------------------
-# TOKEN-BASED TEXT PARSER (🔥 THIS FIXES IT)
+# WORD-BASED PARSER (🔥 THIS ONE WORKS)
 # ---------------------------------------------------------
 
-def parse_text_tokens(text, year, page_num, source_filename):
-    """
-    Parse extremely broken Bank Islam PDFs using token stream logic
-    """
+def parse_words(page, year, page_num, source_filename):
     transactions = []
 
-    # Split ALL tokens (not lines)
-    tokens = re.split(r"\s+", text)
+    words = page.extract_words(use_text_flow=True)
 
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
+    if not words:
+        return transactions
 
-        # Detect date token
-        if re.match(r"\d{2}/\d{2}/\d{2}", token):
-            date_raw = token
+    # Group words by row (y-coordinate)
+    rows = {}
+    for w in words:
+        y = round(w["top"], 1)
+        rows.setdefault(y, []).append(w)
 
-            description_parts = []
-            credit = None
-            balance = None
+    # Sort rows top to bottom
+    for y in sorted(rows.keys()):
+        row_words = sorted(rows[y], key=lambda x: x["x0"])
+        row_text = " ".join(w["text"] for w in row_words)
 
-            j = i + 1
+        # Look for transaction rows
+        # Example:
+        # 31/01/25 0160 PROFIT PAID 2.61 12,292.23
+        if re.search(r"\d{2}/\d{2}/\d{2}", row_text) and re.search(r"\d+\.\d{2}", row_text):
+            parts = row_text.split()
 
-            # Skip numeric codes (0160, etc.)
-            while j < len(tokens) and tokens[j].isdigit():
-                j += 1
+            date_raw = parts[0]
 
-            # Collect description until we hit a money value
-            while j < len(tokens):
-                if re.match(r"[\d,]+\.\d{2}", tokens[j]):
-                    credit = clean_amount(tokens[j])
+            amounts = [p for p in parts if re.match(r"[\d,]+\.\d{2}", p)]
+            if len(amounts) < 1:
+                continue
+
+            credit = clean_amount(amounts[0])
+            balance = clean_amount(amounts[1]) if len(amounts) > 1 else None
+
+            # Description = text between code and first amount
+            desc_parts = []
+            for p in parts[1:]:
+                if re.match(r"[\d,]+\.\d{2}", p):
                     break
-                description_parts.append(tokens[j])
-                j += 1
-
-            # Next money token = balance
-            if credit is not None and j + 1 < len(tokens):
-                if re.match(r"[\d,]+\.\d{2}", tokens[j + 1]):
-                    balance = clean_amount(tokens[j + 1])
+                if not p.isdigit():
+                    desc_parts.append(p)
 
             transactions.append({
                 "date": format_date(date_raw, year),
-                "description": " ".join(description_parts).strip(),
+                "description": " ".join(desc_parts),
                 "debit": 0.0,
-                "credit": credit or 0.0,
+                "credit": credit,
                 "balance": balance,
                 "page": page_num,
                 "source_file": source_filename,
                 "bank": "Bank Islam"
             })
-
-            i = j + 2
-        else:
-            i += 1
 
     return transactions
 
@@ -117,73 +98,14 @@ def parse_text_tokens(text, year, page_num, source_filename):
 # ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    all_transactions = []
-    detected_year = None
+    all_tx = []
 
-    # Detect year
-    for page in pdf.pages[:2]:
-        text = page.extract_text() or ""
-        detected_year = extract_year_from_text(text)
-        if detected_year:
-            break
-
-    if not detected_year:
-        detected_year = str(datetime.now().year)
+    # Detect year from first page text
+    first_text = pdf.pages[0].extract_text() or ""
+    year = extract_year(first_text)
 
     for page_num, page in enumerate(pdf.pages, start=1):
-        tables = page.extract_tables()
-        text = page.extract_text() or ""
+        all_tx.extend(parse_words(page, year, page_num, source_filename))
 
-        # -------------------------------
-        # TABLE MODE (OLD FORMAT)
-        # -------------------------------
-        if tables:
-            for table in tables:
-                if not table or len(table) < 2:
-                    continue
+    return all_tx
 
-                for row in table[1:]:
-                    if len(row) < 10:
-                        continue
-
-                    (
-                        no,
-                        date_raw,
-                        _,
-                        _,
-                        desc,
-                        _,
-                        _,
-                        debit_raw,
-                        credit_raw,
-                        balance_raw
-                    ) = row[:10]
-
-                    if not date_raw or "Total" in str(no):
-                        continue
-
-                    all_transactions.append({
-                        "date": format_date(date_raw, detected_year),
-                        "description": " ".join(str(desc).split()),
-                        "debit": clean_amount(debit_raw),
-                        "credit": clean_amount(credit_raw),
-                        "balance": clean_amount(balance_raw),
-                        "page": page_num,
-                        "source_file": source_filename,
-                        "bank": "Bank Islam"
-                    })
-
-        # -------------------------------
-        # TOKEN MODE (NEW FORMAT)
-        # -------------------------------
-        else:
-            all_transactions.extend(
-                parse_text_tokens(
-                    text,
-                    detected_year,
-                    page_num,
-                    source_filename
-                )
-            )
-
-    return all_transactions
