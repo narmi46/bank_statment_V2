@@ -1,5 +1,5 @@
 # bank_rakyat.py
-# Bank Rakyat – Balance-driven parser (Bank Islam style)
+# Bank Rakyat – Balance-driven parser (Bank Islam standard)
 
 import re
 import fitz
@@ -46,15 +46,18 @@ def extract_opening_balance(text):
 
 
 # ---------------------------------------------------------
-# TABLE PARSER (balance-driven)
+# TABLE PARSER (BALANCE-DRIVEN)
 # ---------------------------------------------------------
 
 def parse_with_tables(pdf, source_filename):
     rows = []
 
-    # --- opening balance from first page ---
-    first_page_text = pdf.pages[0].extract_text() or ""
-    prev_balance = extract_opening_balance(first_page_text)
+    # 🔴 CRITICAL: extract opening balance from FULL DOCUMENT
+    full_text = ""
+    for p in pdf.pages:
+        full_text += (p.extract_text() or "") + "\n"
+
+    prev_balance = extract_opening_balance(full_text)
 
     for page_no, page in enumerate(pdf.pages, start=1):
         tables = page.extract_tables()
@@ -88,11 +91,11 @@ def parse_with_tables(pdf, source_filename):
                 if not iso_date:
                     continue
 
-                desc = row_text
-                desc = desc.replace(date_match.group(), "")
+                desc = row_text.replace(date_match.group(), "")
                 desc = desc.replace(amounts[-1], "")
                 desc = " ".join(desc.split())
 
+                # 🛡️ SAFETY: ensure first delta is computed correctly
                 debit = credit = 0.0
                 if prev_balance is not None:
                     delta = round(balance - prev_balance, 2)
@@ -100,6 +103,9 @@ def parse_with_tables(pdf, source_filename):
                         credit = delta
                     elif delta < 0:
                         debit = abs(delta)
+                else:
+                    prev_balance = balance
+                    continue
 
                 prev_balance = balance
 
@@ -118,7 +124,7 @@ def parse_with_tables(pdf, source_filename):
 
 
 # ---------------------------------------------------------
-# PyMuPDF FALLBACK (balance-driven)
+# PyMuPDF FALLBACK (BALANCE-DRIVEN)
 # ---------------------------------------------------------
 
 def parse_with_pymupdf(pdf, source_filename):
@@ -128,7 +134,12 @@ def parse_with_pymupdf(pdf, source_filename):
     pdf_bytes = pdf.stream.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    prev_balance = extract_opening_balance(doc[0].get_text())
+    # 🔴 FULL DOCUMENT opening balance
+    full_text = ""
+    for i in range(doc.page_count):
+        full_text += doc[i].get_text() + "\n"
+
+    prev_balance = extract_opening_balance(full_text)
 
     for page_index in range(doc.page_count):
         page = doc[page_index]
@@ -159,8 +170,7 @@ def parse_with_pymupdf(pdf, source_filename):
             if balance is None or not iso_date:
                 continue
 
-            desc = row_text
-            desc = desc.replace(date_match.group(), "")
+            desc = row_text.replace(date_match.group(), "")
             desc = desc.replace(amounts[-1], "")
             desc = " ".join(desc.split())
 
@@ -171,6 +181,9 @@ def parse_with_pymupdf(pdf, source_filename):
                     credit = delta
                 elif delta < 0:
                     debit = abs(delta)
+            else:
+                prev_balance = balance
+                continue
 
             prev_balance = balance
 
@@ -189,7 +202,7 @@ def parse_with_pymupdf(pdf, source_filename):
 
 
 # ---------------------------------------------------------
-# MAIN ENTRY
+# MAIN ENTRY (STANDARDIZED)
 # ---------------------------------------------------------
 
 def parse_bank_rakyat(pdf, source_filename=""):
