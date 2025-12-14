@@ -109,9 +109,12 @@ if uploaded_files and st.session_state.status == "running":
                 elif bank_choice == "RHB Bank":
                     tx = parse_transactions_rhb(pdf, uploaded_file.name)
                 
-                elif bank_choice == "CIMB Bank":
-                    tx = parse_transactions_cimb(pdf, uploaded_file.name)
-                
+                elif bank_choice == "RHB Bank":
+                    tx = []
+                    for page_num, page in enumerate(pdf.pages, start=1):
+                        text = page.extract_text() or ""
+                        tx.extend(parse_transactions_rhb(text, page_num))
+                        
                 elif bank_choice == "Bank Islam":
                     tx = parse_bank_islam(pdf, uploaded_file.name)
                 
