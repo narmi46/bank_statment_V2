@@ -134,12 +134,13 @@ if uploaded_files and st.session_state.status == "running":
                 elif bank_choice == "Bank Islam":
                     tx = parse_bank_islam(pdf, uploaded_file.name)
 
+                elif bank_choice == "Bank Rakyat":
+                    tx = parse_bank_rakyat(pdf, uploaded_file.name)
+
                 # ---------------------------------------------------
                 # NEW BANKS (ADDED ONLY)
                 # ---------------------------------------------------
-                elif bank_choice == "Bank Rakyat":
-                    tx = parse_transactions_bank_rakyat(pdf, uploaded_file.name)
-
+    
                 elif bank_choice == "Bank Muamalat":
                     tx = parse_transactions_bank_muamalat(pdf, uploaded_file.name)
 
