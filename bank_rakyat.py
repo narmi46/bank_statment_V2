@@ -1,13 +1,12 @@
 # bank_rakyat.py
-# Bank Rakyat – Balance-driven parser (2-pass, production safe)
+# Bank Rakyat – Balance-driven, summary-aware parser (FINAL)
 
 import re
-import fitz
 from datetime import datetime
 
 
 # ---------------------------------------------------------
-# helpers
+# Helpers
 # ---------------------------------------------------------
 
 def clean_amount(val):
@@ -18,43 +17,68 @@ def clean_amount(val):
 
 
 def parse_date(raw):
-    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
-        try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-    return None
-
-
-def extract_opening_balance(text):
-    patterns = [
-        r"Opening Balance\s*([\-]?\d[\d,]*\.\d{2})",
-        r"Baki Permulaan\s*([\-]?\d[\d,]*\.\d{2})",
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return clean_amount(m.group(1))
-    return None
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------
-# PASS 1 — Extract RAW rows (date + desc + balance)
+# Extract summary section (source of truth)
 # ---------------------------------------------------------
 
-def extract_raw_rows(pdf):
-    raw = []
+def extract_summary(full_text):
+    """
+    Extracts opening, total debit, total credit, closing.
+    Works even if values appear BELOW labels.
+    """
+
+    nums = [clean_amount(x) for x in re.findall(r"[-]?\d[\d,]*\.\d{2}", full_text)]
+    nums = [n for n in nums if n is not None]
+
+    summary = {
+        "opening": None,
+        "total_debit": None,
+        "total_credit": None,
+        "closing": None,
+    }
+
+    # Explicit patterns (preferred)
+    m = re.search(r"(Opening Balance|Baki Permulaan)[^\d\-]*([-]?\d[\d,]*\.\d{2})", full_text, re.I | re.S)
+    if m:
+        summary["opening"] = clean_amount(m.group(2))
+
+    m = re.search(r"(Closing Balance|Baki Penutup)[^\d\-]*([-]?\d[\d,]*\.\d{2})", full_text, re.I | re.S)
+    if m:
+        summary["closing"] = clean_amount(m.group(2))
+
+    # Fallback: Bank Rakyat summary row ALWAYS has 4 numbers
+    # [opening, total debit, total credit, closing]
+    if len(nums) >= 4:
+        summary["opening"] = summary["opening"] or nums[-4]
+        summary["total_debit"] = nums[-3]
+        summary["total_credit"] = nums[-2]
+        summary["closing"] = summary["closing"] or nums[-1]
+
+    return summary
+
+
+# ---------------------------------------------------------
+# Extract raw transaction rows (order-independent)
+# ---------------------------------------------------------
+
+def extract_transactions(pdf):
+    rows = []
 
     for page_no, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        for line in text.splitlines():
 
-        for line in lines:
             date_match = re.search(r"\d{2}/\d{2}/\d{4}", line)
             if not date_match:
                 continue
 
-            amounts = re.findall(r"[+-]?\d[\d,]*\.\d{2}", line)
+            amounts = re.findall(r"[-]?\d[\d,]*\.\d{2}", line)
             if not amounts:
                 continue
 
@@ -70,29 +94,47 @@ def extract_raw_rows(pdf):
             desc = desc.replace(amounts[-1], "")
             desc = " ".join(desc.split())
 
-            raw.append({
+            rows.append({
                 "date": iso_date,
                 "description": desc,
                 "balance": balance,
                 "page": page_no,
             })
 
-    return raw
+    return rows
 
 
 # ---------------------------------------------------------
-# PASS 2 — Compute debit / credit safely
+# MAIN ENTRY
 # ---------------------------------------------------------
 
-def apply_balance_delta(raw_rows, opening_balance, source_filename):
+def parse_bank_rakyat(pdf, source_filename=""):
+    # Read entire document text
+    full_text = ""
+    for p in pdf.pages:
+        full_text += (p.extract_text() or "") + "\n"
+
+    summary = extract_summary(full_text)
+    raw_rows = extract_transactions(pdf)
+
     if not raw_rows:
         return []
 
-    # Sort by date then page
+    # Sort chronologically
     raw_rows.sort(key=lambda x: (x["date"], x["page"]))
 
+    # Determine opening balance (BEST METHOD)
+    opening = summary["opening"]
+
+    if opening is None and summary["closing"] is not None:
+        opening = (
+            summary["closing"]
+            - (summary["total_credit"] or 0)
+            + (summary["total_debit"] or 0)
+        )
+
     results = []
-    prev_balance = opening_balance
+    prev_balance = opening
 
     for row in raw_rows:
         debit = credit = 0.0
@@ -118,20 +160,3 @@ def apply_balance_delta(raw_rows, opening_balance, source_filename):
         })
 
     return results
-
-
-# ---------------------------------------------------------
-# MAIN ENTRY
-# ---------------------------------------------------------
-
-def parse_bank_rakyat(pdf, source_filename=""):
-    # Extract opening balance from FULL document
-    full_text = ""
-    for p in pdf.pages:
-        full_text += (p.extract_text() or "") + "\n"
-
-    opening_balance = extract_opening_balance(full_text)
-
-    raw_rows = extract_raw_rows(pdf)
-
-    return apply_balance_delta(raw_rows, opening_balance, source_filename)
