@@ -65,31 +65,53 @@ def format_date(date_raw, year):
 
 def parse_text_transactions(text, year, page_num, source_filename):
     """
-    Parse summary-style Bank Islam statements (no tables)
+    Robust parser for Bank Islam text-only statements
+    Handles broken lines and PDF extraction quirks
     """
     transactions = []
 
-    # Example line:
-    # 31/01/25 0160 PROFIT PAID 2.61 12,292.23
-    pattern = re.compile(
-        r'(\d{2}/\d{2}/\d{2})\s+\d+\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})'
-    )
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    for match in pattern.finditer(text):
-        date_raw, desc, credit_raw, balance_raw = match.groups()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
 
-        transactions.append({
-            "date": format_date(date_raw, year),
-            "description": desc.strip(),
-            "debit": 0.0,
-            "credit": clean_amount(credit_raw),
-            "balance": clean_amount(balance_raw),
-            "page": page_num,
-            "source_file": source_filename,
-            "bank": "Bank Islam"
-        })
+        # Look for date line: 31/01/25
+        date_match = re.match(r"(\d{2}/\d{2}/\d{2})\s+\d+\s+(.+)", line)
+        if date_match:
+            date_raw, desc_part = date_match.groups()
+            description = desc_part.strip()
+
+            credit = 0.0
+            balance = None
+
+            # Look ahead for amounts (next 1–3 lines)
+            lookahead = " ".join(lines[i:i+3])
+
+            amount_match = re.search(
+                r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
+                lookahead
+            )
+
+            if amount_match:
+                credit = clean_amount(amount_match.group(1))
+                balance = clean_amount(amount_match.group(2))
+
+            transactions.append({
+                "date": format_date(date_raw, year),
+                "description": description,
+                "debit": 0.0,
+                "credit": credit,
+                "balance": balance,
+                "page": page_num,
+                "source_file": source_filename,
+                "bank": "Bank Islam"
+            })
+
+        i += 1
 
     return transactions
+
 
 
 # ---------------------------------------------------------
