@@ -18,7 +18,7 @@ MONTH_MAP = {
 _prev_balance_global = None
 
 # ============================================================
-# HELPERS
+# REGEXES
 # ============================================================
 
 DATE_RE = re.compile(
@@ -27,12 +27,14 @@ DATE_RE = re.compile(
 )
 
 MONEY_RE = re.compile(r'\d{1,3}(?:,\d{3})*\.\d{2}-?')
-
 SERIAL_RE = re.compile(r'\b\d{6,}\b')
 
+# ============================================================
+# HELPERS
+# ============================================================
 
-def clean_text(t):
-    return " ".join(t.split()).strip()
+def clean_text(text):
+    return " ".join(text.split()).strip() if text else ""
 
 
 def parse_amount(s):
@@ -69,7 +71,7 @@ def classify_first_tx(desc, amount):
 
 
 # ============================================================
-# PARSE ONE TRANSACTION BLOCK (CORRECT WAY)
+# PARSE ONE TRANSACTION BLOCK
 # ============================================================
 
 def parse_block(block_lines, page_num, year):
@@ -77,7 +79,7 @@ def parse_block(block_lines, page_num, year):
 
     block_text = " ".join(block_lines)
 
-    # Skip balances
+    # Skip balance rows
     if "B/F BALANCE" in block_text or "C/F BALANCE" in block_text:
         return None
 
@@ -89,7 +91,7 @@ def parse_block(block_lines, page_num, year):
     day, mon = m.groups()
     date = f"{year}-{MONTH_MAP[mon.capitalize()]}-{day.zfill(2)}"
 
-    # Extract monetary values (STRICT)
+    # Extract money values (amount + balance)
     monies = MONEY_RE.findall(block_text)
     if len(monies) < 2:
         return None
@@ -102,7 +104,7 @@ def parse_block(block_lines, page_num, year):
     desc = SERIAL_RE.sub("", desc)
     desc = clean_text(desc)
 
-    # Debit / Credit logic
+    # Debit / Credit
     if _prev_balance_global is None:
         debit, credit = classify_first_tx(desc, amount)
     else:
@@ -121,10 +123,14 @@ def parse_block(block_lines, page_num, year):
 
 
 # ============================================================
-# MAIN PARSER (PAGE-SAFE, BLOCK-SAFE)
+# MAIN PARSER (NO YEAR REQUIRED)
 # ============================================================
 
-def parse_transactions_rhb(text, page_num, year):
+def parse_transactions_rhb(text, page_num, year=2024):
+    """
+    Parse ONE page of RHB statement text.
+    Year defaults to 2024 so caller does not need to pass it.
+    """
     global _prev_balance_global
 
     if page_num == 1:
@@ -137,7 +143,7 @@ def parse_transactions_rhb(text, page_num, year):
     while i < len(lines):
         line = lines[i].strip()
 
-        # Look for date start
+        # Look for start of transaction
         if not DATE_RE.match(line):
             i += 1
             continue
