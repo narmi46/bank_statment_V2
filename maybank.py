@@ -11,43 +11,35 @@ def extract_year_from_text(text):
     Looks for common patterns like 'Statement Date', 'Period', etc.
     Handles both 4-digit (2024) and 2-digit (24) year formats.
     """
-    patterns = [
-        # Pattern for "STATEMENT DATE : 30/09/24" or "TARIKH PENYATA : 30/09/24"
-        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
-        # Pattern for "Statement Date: DD Mon YYYY" 
-        r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})',
-        # Pattern for "YYYY Statement"
-        r'(\d{4})\s+Statement',
-        # Pattern for "Mon YYYY"
-        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})',
-        # Pattern for DD/MM/YYYY format
-        r'(\d{2})/(\d{2})/(\d{4})',
-        # Pattern for DD/MM/YY format (2-digit year)
-        r'(\d{2})/(\d{2})/(\d{2})(?!\d)',
-    ]
+    # Try specific patterns first (most reliable)
     
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            groups = match.groups()
-            # Find the year in groups
-            for group in groups:
-                if not group or not group.isdigit():
-                    continue
-                
-                # Handle 4-digit year
-                if len(group) == 4:
-                    year = int(group)
-                    if 2000 <= year <= 2100:
-                        return str(year)
-                
-                # Handle 2-digit year (assume 2000s)
-                elif len(group) == 2:
-                    year_2digit = int(group)
-                    # Convert 2-digit to 4-digit (00-99 -> 2000-2099)
-                    if 0 <= year_2digit <= 99:
-                        year = 2000 + year_2digit
-                        return str(year)
+    # Pattern 1: STATEMENT DATE : 30/09/24 (capture only the year part)
+    match = re.search(r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})', text, re.IGNORECASE)
+    if match:
+        year_str = match.group(1)
+        if len(year_str) == 4:
+            return year_str
+        elif len(year_str) == 2:
+            return str(2000 + int(year_str))
+    
+    # Pattern 2: Statement Date: DD Mon YYYY
+    match = re.search(r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})', text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # Pattern 3: YYYY Statement
+    match = re.search(r'(\d{4})\s+Statement', text, re.IGNORECASE)
+    if match:
+        year = int(match.group(1))
+        if 2000 <= year <= 2100:
+            return str(year)
+    
+    # Pattern 4: Mon YYYY
+    match = re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})', text, re.IGNORECASE)
+    if match:
+        year = int(match.group(1))
+        if 2000 <= year <= 2100:
+            return str(year)
     
     return None
 

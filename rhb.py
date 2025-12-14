@@ -10,34 +10,33 @@ def extract_year_from_text(text):
     Extract year from RHB Bank statement.
     Handles both 4-digit (2024) and 2-digit (24) year formats.
     """
-    patterns = [
-        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
-        r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})',
-        r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})',
-        r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{2,4})',
-        r'(\d{2})/(\d{2})/(\d{2,4})',
-    ]
+    # Try specific patterns first (most reliable)
     
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            groups = match.groups()
-            for group in groups:
-                if not group or not group.isdigit():
-                    continue
-                
-                # Handle 4-digit year
-                if len(group) == 4:
-                    year = int(group)
-                    if 2000 <= year <= 2100:
-                        return str(year)
-                
-                # Handle 2-digit year
-                elif len(group) == 2:
-                    year_2digit = int(group)
-                    if 0 <= year_2digit <= 99:
-                        year = 2000 + year_2digit
-                        return str(year)
+    # Pattern 1: STATEMENT DATE : 30/09/24
+    match = re.search(r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})', text, re.IGNORECASE)
+    if match:
+        year_str = match.group(1)
+        if len(year_str) == 4:
+            return year_str
+        elif len(year_str) == 2:
+            return str(2000 + int(year_str))
+    
+    # Pattern 2: Statement Date: DD Mon YYYY
+    match = re.search(r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})', text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # Pattern 3: FOR THE PERIOD : DD Mon YYYY
+    match = re.search(r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})', text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    # Pattern 4: DD Mon YYYY (in text)
+    match = re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})', text, re.IGNORECASE)
+    if match:
+        year = int(match.group(2))
+        if 2000 <= year <= 2100:
+            return str(year)
     
     return None
 
