@@ -13,11 +13,12 @@ from public_bank import parse_transactions_pbb
 from rhb_adapter import parse_transactions_rhb
 from cimb import parse_transactions_cimb
 from bank_islam import parse_bank_islam
+from bank_rakyat import parse_bank_rakyat
 
 # ---------------------------------------------------
 # NEW BANK PARSERS (ADDED ONLY)
 # ---------------------------------------------------
-from bank_rakyat import parse_transactions_bank_rakyat
+
 from bank_muamalat import parse_transactions_bank_muamalat
 
 
