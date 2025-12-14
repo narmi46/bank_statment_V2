@@ -1,119 +1,99 @@
-# maybank.py - Standalone Maybank Parser
+# maybank.py - Robust Standalone Maybank Parser
 import re
+from datetime import datetime
 
 # ============================================================
-# YEAR EXTRACTION FROM PDF
+# YEAR EXTRACTION FROM PDF (ROBUST)
 # ============================================================
 
 def extract_year_from_text(text):
     """
     Extract year from Maybank statement text.
-    Looks for common patterns like 'Statement Date', 'Period', etc.
-    Handles both 4-digit (2024) and 2-digit (24) year formats.
+    Supports English + Malay formats and date ranges.
     """
-    # Try specific patterns first (most reliable)
-    
-    # Pattern 1: STATEMENT DATE : 30/09/24 (capture only the year part)
-    match = re.search(r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})', text, re.IGNORECASE)
+    if not text:
+        return None
+
+    # 1️⃣ STATEMENT DATE : 30/09/24 or 30/09/2024
+    match = re.search(
+        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
+        text,
+        re.IGNORECASE,
+    )
     if match:
-        year_str = match.group(1)
-        if len(year_str) == 4:
-            return year_str
-        elif len(year_str) == 2:
-            return str(2000 + int(year_str))
-    
-    # Pattern 2: Statement Date: DD Mon YYYY
-    match = re.search(r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})', text, re.IGNORECASE)
+        y = match.group(1)
+        return str(2000 + int(y)) if len(y) == 2 else y
+
+    # 2️⃣ STATEMENT PERIOD : 01/08/2024 - 31/08/2024
+    match = re.search(
+        r'\d{1,2}/\d{1,2}/(\d{4})\s*-\s*\d{1,2}/\d{1,2}/\d{4}',
+        text,
+    )
     if match:
         return match.group(1)
-    
-    # Pattern 3: YYYY Statement
-    match = re.search(r'(\d{4})\s+Statement', text, re.IGNORECASE)
+
+    # 3️⃣ Statement Date: 30 Sep 2024
+    match = re.search(
+        r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}\s+[A-Za-z]+\s+(\d{4})',
+        text,
+        re.IGNORECASE,
+    )
     if match:
-        year = int(match.group(1))
-        if 2000 <= year <= 2100:
-            return str(year)
-    
-    # Pattern 4: Mon YYYY
-    match = re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})', text, re.IGNORECASE)
+        return match.group(1)
+
+    # 4️⃣ English month YYYY
+    match = re.search(
+        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})',
+        text,
+        re.IGNORECASE,
+    )
     if match:
-        year = int(match.group(1))
-        if 2000 <= year <= 2100:
-            return str(year)
-    
+        return match.group(2)
+
+    # 5️⃣ Malay month YYYY
+    match = re.search(
+        r'(JANUARI|FEBRUARI|MAC|APRIL|MEI|JUN|JULAI|OGOS|SEPTEMBER|OKTOBER|NOVEMBER|DISEMBER)\s+(\d{4})',
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(2)
+
     return None
 
 
 # ============================================================
-# UNIVERSAL CLEANER FOR MAYBANK TEXT
+# UNIVERSAL CLEANER
 # ============================================================
 
 def clean_maybank_line(line):
-    """Remove invisible unicode and normalize spaces"""
     if not line:
         return ""
-    
-    # Remove invisible unicode junk
-    line = line.replace("\u200b", "")   # zero-width space
-    line = line.replace("\u200e", "")   # LTR mark
-    line = line.replace("\u200f", "")   # RTL mark
-    line = line.replace("\ufeff", "")   # BOM
-    line = line.replace("\xa0", " ")    # non-breaking space
-    
-    # Collapse multiple spaces
+
+    for ch in ["\u200b", "\u200e", "\u200f", "\ufeff"]:
+        line = line.replace(ch, "")
+    line = line.replace("\xa0", " ")
+
     line = re.sub(r"\s+", " ", line)
-    
     return line.strip()
 
 
 # ============================================================
-# MAYBANK MTASB PATTERN (NO YEAR FORMAT: DD/MM)
+# REGEX PATTERNS
 # ============================================================
 
 PATTERN_MAYBANK_MTASB = re.compile(
-    r"(\d{2}/\d{2})\s+"                 # Date: 01/08
-    r"(.+?)\s+"                         # Description
-    r"([0-9,]+\.\d{2})\s*([+-])\s*"     # Amount + Sign (tolerant spacing)
-    r"([0-9,]+\.\d{2})"                 # Balance
+    r"(\d{2}/\d{2})\s+"
+    r"(.+?)\s+"
+    r"([0-9,]+\.\d{2})\s*([+-])\s*"
+    r"([0-9,]+\.\d{2})"
 )
 
-def parse_line_maybank_mtasb(line, page_num, year):
-    """Parse MTASB format: DD/MM DESCRIPTION AMOUNT +/- BALANCE"""
-    m = PATTERN_MAYBANK_MTASB.search(line)
-    if not m:
-        return None
-    
-    date_raw, desc, amount_raw, sign, balance_raw = m.groups()
-    day, month = date_raw.split("/")
-    
-    amount = float(amount_raw.replace(",", ""))
-    balance = float(balance_raw.replace(",", ""))
-    
-    credit = amount if sign == "+" else 0.0
-    debit = amount if sign == "-" else 0.0
-    
-    # Format: YYYY-MM-DD
-    full_date = f"{year}-{month}-{day}"
-    
-    return {
-        "date": full_date,
-        "description": desc.strip(),
-        "debit": debit,
-        "credit": credit,
-        "balance": balance,
-        "page": page_num,
-    }
-
-
-# ============================================================
-# MAYBANK MBB PATTERN (FULL DATE FORMAT: DD Mon YYYY)
-# ============================================================
-
 PATTERN_MAYBANK_MBB = re.compile(
-    r"(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\s+"  # Date
-    r"(.+?)\s+"                               # Description
-    r"([0-9,]+\.\d{2})\s*([+-])\s*"          # Amount + Sign
-    r"([0-9,]+\.\d{2})"                      # Balance
+    r"(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\s+"
+    r"(.+?)\s+"
+    r"([0-9,]+\.\d{2})\s*([+-])\s*"
+    r"([0-9,]+\.\d{2})"
 )
 
 MONTH_MAP = {
@@ -122,124 +102,131 @@ MONTH_MAP = {
     "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
 }
 
+
+# ============================================================
+# PARSERS
+# ============================================================
+
+def parse_line_maybank_mtasb(line, page_num, year):
+    m = PATTERN_MAYBANK_MTASB.search(line)
+    if not m:
+        return None
+
+    date_raw, desc, amount_raw, sign, balance_raw = m.groups()
+    day, month = date_raw.split("/")
+
+    try:
+        amount = float(amount_raw.replace(",", ""))
+        balance = float(balance_raw.replace(",", ""))
+    except ValueError:
+        return None
+
+    return {
+        "date": f"{year}-{month}-{day}",
+        "description": desc.strip(),
+        "debit": amount if sign == "-" else 0.0,
+        "credit": amount if sign == "+" else 0.0,
+        "balance": balance,
+        "page": page_num,
+        "month": int(month),
+    }
+
+
 def parse_line_maybank_mbb(line, page_num):
-    """Parse MBB format: DD Mon YYYY DESCRIPTION AMOUNT +/- BALANCE"""
     m = PATTERN_MAYBANK_MBB.search(line)
     if not m:
         return None
-    
-    day, mon_abbr, year, desc, amount_raw, sign, balance_raw = m.groups()
-    month = MONTH_MAP.get(mon_abbr.title(), "01")
-    
-    amount = float(amount_raw.replace(",", ""))
-    balance = float(balance_raw.replace(",", ""))
-    
-    credit = amount if sign == "+" else 0.0
-    debit = amount if sign == "-" else 0.0
-    
-    # Format: YYYY-MM-DD
-    full_date = f"{year}-{month}-{day}"
-    
+
+    day, mon, year, desc, amount_raw, sign, balance_raw = m.groups()
+    month = MONTH_MAP.get(mon.title())
+    if not month:
+        return None
+
+    try:
+        amount = float(amount_raw.replace(",", ""))
+        balance = float(balance_raw.replace(",", ""))
+    except ValueError:
+        return None
+
     return {
-        "date": full_date,
+        "date": f"{year}-{month}-{day}",
         "description": desc.strip(),
-        "debit": debit,
-        "credit": credit,
+        "debit": amount if sign == "-" else 0.0,
+        "credit": amount if sign == "+" else 0.0,
         "balance": balance,
         "page": page_num,
     }
 
 
 # ============================================================
-# LINE RECONSTRUCTOR FOR BROKEN DESCRIPTIONS
+# BROKEN LINE RECONSTRUCTION
 # ============================================================
 
 def reconstruct_broken_lines(lines):
-    """
-    Fixes broken DUITNOW / long descriptions that span multiple lines.
-    Merges continuation lines with the main transaction line.
-    """
     rebuilt = []
-    buffer_line = ""
-    
+    buffer = ""
+
     for line in lines:
         line = clean_maybank_line(line)
-        
         if not line:
             continue
-        
-        # If line begins with date, flush buffer and start new
+
         if re.match(r"^\d{2}/\d{2}", line) or re.match(r"^\d{2}\s+[A-Za-z]{3}\s+\d{4}", line):
-            if buffer_line:
-                rebuilt.append(buffer_line)
-                buffer_line = ""
-            buffer_line = line
+            if buffer:
+                rebuilt.append(buffer)
+            buffer = line
         else:
-            # Continuation of previous description
-            buffer_line += " " + line
-    
-    if buffer_line:
-        rebuilt.append(buffer_line)
-    
+            buffer += " " + line
+
+    if buffer:
+        rebuilt.append(buffer)
+
     return rebuilt
 
 
 # ============================================================
-# MAIN PARSER ENTRY POINT
+# MAIN ENTRY POINT
 # ============================================================
 
 def parse_transactions_maybank(pdf, source_filename=""):
-    """
-    Main parser for Maybank statements.
-    Automatically extracts year from PDF and parses all transactions.
-    
-    Args:
-        pdf: pdfplumber PDF object
-        source_filename: Name of the source file for reference
-    
-    Returns:
-        List of transaction dictionaries
-    """
     all_transactions = []
     detected_year = None
-    
-    # Try to extract year from first few pages
-    for page in pdf.pages[:3]:  # Check first 3 pages
-        text = page.extract_text() or ""
-        detected_year = extract_year_from_text(text)
+
+    # 🔍 Scan ALL pages for year (safe & cheap)
+    for page in pdf.pages:
+        detected_year = extract_year_from_text(page.extract_text() or "")
         if detected_year:
             break
-    
-    # Fallback to current year if not detected
+
     if not detected_year:
-        from datetime import datetime
-        detected_year = str(datetime.now().year)
-    
-    # Process all pages
+        raise ValueError("❌ Year could not be detected from Maybank statement")
+
+    current_year = int(detected_year)
+    last_month = None
+
     for page_num, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
-        
-        raw_lines = text.splitlines()
-        cleaned_lines = [clean_maybank_line(l) for l in raw_lines]
-        
-        # Reconstruct broken lines
-        lines = reconstruct_broken_lines(cleaned_lines)
-        
+        lines = reconstruct_broken_lines(text.splitlines())
+
         for line in lines:
-            # Try MTASB format (DD/MM)
-            tx = parse_line_maybank_mtasb(line, page_num, detected_year)
+            tx = parse_line_maybank_mtasb(line, page_num, current_year)
             if tx:
-                tx["source_file"] = source_filename
+                # ✅ Year rollover handling (Dec → Jan)
+                if last_month and tx["month"] < last_month:
+                    current_year += 1
+                last_month = tx["month"]
+
+                tx["date"] = f"{current_year}-{tx['date'][5:]}"
                 tx["bank"] = "Maybank"
+                tx["source_file"] = source_filename
+                tx.pop("month", None)
                 all_transactions.append(tx)
                 continue
-            
-            # Try MBB format (DD Mon YYYY)
+
             tx = parse_line_maybank_mbb(line, page_num)
             if tx:
-                tx["source_file"] = source_filename
                 tx["bank"] = "Maybank"
+                tx["source_file"] = source_filename
                 all_transactions.append(tx)
-                continue
-    
+
     return all_transactions
