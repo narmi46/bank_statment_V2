@@ -1,5 +1,8 @@
 import regex as re
-from datetime import datetime
+
+# ============================================================
+# MONTH MAP
+# ============================================================
 
 MONTH_MAP = {
     "Jan": "01", "Feb": "02", "Mar": "03",
@@ -8,87 +11,211 @@ MONTH_MAP = {
     "Oct": "10", "Nov": "11", "Dec": "12"
 }
 
-_prev_balance = None
+# ============================================================
+# INTERNAL STATE (RESETS PER FILE)
+# ============================================================
 
-def clean_desc(s):
-    return " ".join(s.split()) if s else ""
+_prev_balance_global = None
 
-def extract_year_from_pdf(pdf):
-    for p in pdf.pages[:2]:
-        t = p.extract_text() or ""
-        m = re.search(r'Statement Period.*?(\d{1,2})\s+\w+\s+(\d{2,4})', t)
-        if m:
-            y = m.group(2)
-            return int("20" + y if len(y) == 2 else y)
-    return datetime.now().year
+# ============================================================
+# SIMPLE DESCRIPTION CLEANER
+# ============================================================
 
-def compute_debit_credit(prev, curr):
-    if prev is None:
+def fix_description(desc):
+    if not desc:
+        return desc
+    return " ".join(desc.split())
+
+# ============================================================
+# BALANCE → DEBIT / CREDIT LOGIC
+# ============================================================
+
+def compute_debit_credit(prev_balance, curr_balance):
+    if prev_balance is None:
         return 0.0, 0.0
-    diff = round(curr - prev, 2)
+
+    diff = round(curr_balance - prev_balance, 2)
+
     if diff > 0:
         return 0.0, diff
     elif diff < 0:
         return abs(diff), 0.0
     return 0.0, 0.0
 
-def classify_first(desc, amt):
-    s = desc.upper()
-    if any(k in s for k in ["CR", "DEPOSIT", "INWARD", "CDT"]):
-        return 0.0, amt
-    return amt, 0.0
+# ============================================================
+# FIRST TRANSACTION SCAN METHOD
+# ============================================================
 
-RHB_TX = re.compile(
-    r'(\d{1,2})\s+'
-    r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+'
-    r'(.+?)\s+'
-    r'(\d{4,20})\s+'
-    r'([0-9,]+\.\d{2})\s+'
-    r'([0-9,]+\.\d{2})',
-    re.IGNORECASE
+def classify_first_tx(desc, amount):
+    s = re.sub(r"\s+", "", desc or "").upper()
+    if (
+        "DEPOSIT" in s or
+        "CDT" in s or
+        "INWARD" in s or
+        s.endswith("CR")
+    ):
+        return 0.0, amount
+    return amount, 0.0
+
+# ============================================================
+# REGEX PATTERNS
+# ============================================================
+
+# -------- FORMAT A (Old RHB PDF) --------
+PATTERN_TX_A = re.compile(
+    r"^(\d{1,2})([A-Za-z]{3})\s+"
+    r"(.+?)\s+"
+    r"(\d{4,20})\s+"
+    r"([0-9,]+\.\d{2})\s+"
+    r"([0-9,]+\.\d{2})"
 )
 
-RHB_SKIP = re.compile(r'B/F BALANCE|C/F BALANCE', re.IGNORECASE)
+PATTERN_BF_CF = re.compile(
+    r"^\d{1,2}[A-Za-z]{3}\s+(B/F BALANCE|C/F BALANCE)\s+([0-9,]+\.\d{2})$"
+)
 
-def parse_transactions_rhb(pdf, source_filename=""):
-    global _prev_balance
-    _prev_balance = None
+# -------- FORMAT B (Internet Banking) --------
+PATTERN_TX_B = re.compile(
+    r"(\d{2}-\d{2}-\d{4})\s+"
+    r"(\d{3})\s+"
+    r"(.+?)\s+"
+    r"([0-9,]+\.\d{2}|-)\s+"
+    r"([0-9,]+\.\d{2}|-)\s+"
+    r"([0-9,]+\.\d{2})([+-])"
+)
 
-    tx = []
-    year = extract_year_from_pdf(pdf)
+# -------- FORMAT C (Islamic PDF) --------
+PATTERN_TX_C = re.compile(
+    r"^(\d{1,2})\s+([A-Za-z]{3})\s+"
+    r"(.+?)\s+"
+    r"(\d{4,20})\s+"
+    r"([0-9,]+\.\d{2})\s+"
+    r"([0-9,]+\.\d{2})"
+)
 
-    for page_num, page in enumerate(pdf.pages, 1):
-        text = page.extract_text() or ""
+# ============================================================
+# PARSE SINGLE LINE
+# ============================================================
 
-        for line in text.splitlines():
-            if RHB_SKIP.search(line):
-                continue
+def parse_line_rhb(line, page_num, year):
+    line = line.strip()
+    if not line:
+        return None
 
-            m = RHB_TX.search(line)
-            if not m:
-                continue
+    # --- FORMAT C ---
+    mC = PATTERN_TX_C.match(line)
+    if mC:
+        day, mon, desc, serial, amt, bal = mC.groups()
+        return {
+            "date": f"{year}-{MONTH_MAP.get(mon,'01')}-{day.zfill(2)}",
+            "description": fix_description(desc),
+            "amount_raw": float(amt.replace(",", "")),
+            "balance": float(bal.replace(",", "")),
+            "page": page_num
+        }
 
-            day, mon, desc, serial, amt, bal = m.groups()
+    # --- FORMAT A ---
+    mA = PATTERN_TX_A.match(line)
+    if mA:
+        day, mon, desc, serial, amt, bal = mA.groups()
+        return {
+            "date": f"{year}-{MONTH_MAP.get(mon,'01')}-{day.zfill(2)}",
+            "description": fix_description(desc),
+            "amount_raw": float(amt.replace(",", "")),
+            "balance": float(bal.replace(",", "")),
+            "page": page_num
+        }
 
-            amount = float(amt.replace(",", ""))
-            balance = float(bal.replace(",", ""))
+    # --- B/F or C/F ---
+    if PATTERN_BF_CF.match(line):
+        return "SKIP"
 
-            if _prev_balance is None:
-                debit, credit = classify_first(desc, amount)
-            else:
-                debit, credit = compute_debit_credit(_prev_balance, balance)
+    # --- FORMAT B ---
+    mB = PATTERN_TX_B.search(line)
+    if mB:
+        date_raw, branch, desc, dr, cr, bal, sign = mB.groups()
+        dd, mm, yyyy = date_raw.split("-")
+        bal = float(bal.replace(",", ""))
+        if sign == "-":
+            bal = -bal
 
-            tx.append({
-                "date": f"{year}-{MONTH_MAP[mon]}-{day.zfill(2)}",
-                "description": clean_desc(desc),
-                "debit": debit,
-                "credit": credit,
-                "balance": balance,
-                "page": page_num,
-                "bank": "RHB Bank",
-                "source_file": source_filename
-            })
+        return {
+            "date": f"{yyyy}-{mm}-{dd}",
+            "description": f"{branch} {desc}",
+            "amount_raw": (
+                float(dr.replace(",", "")) if dr != "-" else
+                float(cr.replace(",", "")) if cr != "-" else 0.0
+            ),
+            "balance": bal,
+            "page": page_num
+        }
 
-            _prev_balance = balance
+    return None
 
-    return tx
+# ============================================================
+# PAGE-LEVEL PARSER
+# ============================================================
+
+def parse_transactions_rhb_page(text, page_num, year):
+    global _prev_balance_global
+    tx_list = []
+
+    for line in text.splitlines():
+        parsed = parse_line_rhb(line, page_num, year)
+        if not parsed or parsed == "SKIP":
+            continue
+
+        curr_balance = parsed["balance"]
+        amount = parsed["amount_raw"]
+
+        if _prev_balance_global is None:
+            debit, credit = classify_first_tx(parsed["description"], amount)
+        else:
+            debit, credit = compute_debit_credit(_prev_balance_global, curr_balance)
+
+        tx_list.append({
+            "date": parsed["date"],
+            "description": parsed["description"],
+            "debit": debit,
+            "credit": credit,
+            "balance": curr_balance,
+            "page": page_num
+        })
+
+        _prev_balance_global = curr_balance
+
+    return tx_list
+
+# ============================================================
+# APP v2 ENTRY POINT
+# ============================================================
+
+def parse_transactions_rhb(pdf, source_file):
+    """
+    App v2 compatible RHB parser
+    """
+    global _prev_balance_global
+    _prev_balance_global = None
+
+    all_tx = []
+
+    # Detect year from filename
+    year = 2025
+    for y in range(2015, 2031):
+        if str(y) in source_file:
+            year = y
+            break
+
+    for page_num, page in enumerate(pdf.pages, start=1):
+        text = page.extract_text()
+        if not text:
+            continue
+
+        page_tx = parse_transactions_rhb_page(text, page_num, year)
+
+        for tx in page_tx:
+            tx["bank"] = "RHB Bank"
+            tx["source_file"] = source_file
+            all_tx.append(tx)
+
+    return all_tx
