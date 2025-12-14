@@ -194,6 +194,10 @@ def parse_rhb_pdf(pdf):
 
     return all_transactions
 
-# Backward compatibility
-def parse_transactions_rhb(pdf):
+# Backward compatibility wrapper
+def parse_transactions_rhb(pdf, *args, **kwargs):
+    """
+    Compatibility wrapper so existing app.py calls keep working.
+    Ignores extra arguments safely.
+    """
     return parse_rhb_pdf(pdf)
