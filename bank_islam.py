@@ -1,27 +1,36 @@
-# bank_islam.py
-# Simple, balance-driven Bank Islam parser (PyMuPDF)
-
-import fitz  # PyMuPDF
 import re
 from datetime import datetime
+import fitz
 
+DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})")
+AMT_RE = re.compile(r"[\d,]+\.\d{2}")
 
 def parse_bank_islam(pdf, source_filename=""):
     results = []
 
-    # 🔑 rewind stream (Streamlit-safe)
     pdf.stream.seek(0)
     pdf_bytes = pdf.stream.read()
-
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    previous_balance = None
+    # ✅ 1) Initialize previous_balance using Opening Balance if present
+    full_text = "\n".join(doc[i].get_text() for i in range(min(2, doc.page_count)))
+    opening_balance = None
+
+    m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", full_text, re.IGNORECASE)
+    if m:
+        opening_balance = float(m.group(1).replace(",", ""))
+    else:
+        # fallback for other Bank Islam formats: BAL B/F
+        m2 = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", full_text, re.IGNORECASE)
+        if m2:
+            opening_balance = float(m2.group(1).replace(",", ""))
+
+    previous_balance = opening_balance  # <-- THIS fixes first txn debit/credit
 
     for page_index in range(doc.page_count):
         page = doc[page_index]
         words = page.get_text("words")
 
-        # group words by Y (rows)
         rows = {}
         for x0, y0, x1, y1, text, *_ in words:
             y = round(y0, 1)
@@ -30,44 +39,48 @@ def parse_bank_islam(pdf, source_filename=""):
         for y in sorted(rows):
             row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
 
-            # must contain date
-            date_match = re.search(r"\d{1,2}/\d{1,2}/\d{2}", row_text)
+            # ✅ 2) Support DD/MM/YY and DD/MM/YYYY
+            date_match = DATE_RE.search(row_text)
             if not date_match:
                 continue
 
-            # must contain balance (last amount on row)
-            amounts = re.findall(r"[\d,]+\.\d{2}", row_text)
+            amounts = AMT_RE.findall(row_text)
             if not amounts:
                 continue
 
             balance = float(amounts[-1].replace(",", ""))
 
-            # clean description: remove date + balance
-            description = row_text
-            description = description.replace(date_match.group(), "")
+            # description = same line excluding date + balance only
+            description = row_text.replace(date_match.group(), "")
             description = description.replace(amounts[-1], "")
             description = " ".join(description.split())
 
-            # determine debit / credit using balance delta
             debit = credit = 0.0
             if previous_balance is not None:
-                delta = balance - previous_balance
+                delta = round(balance - previous_balance, 2)
                 if delta > 0:
-                    credit = round(delta, 2)
+                    credit = delta
                 elif delta < 0:
-                    debit = round(abs(delta), 2)
+                    debit = abs(delta)
 
             previous_balance = balance
 
+            # ✅ parse date with both formats
+            raw_date = date_match.group()
+            if len(raw_date.split("/")[-1]) == 4:
+                iso_date = datetime.strptime(raw_date, "%d/%m/%Y").strftime("%Y-%m-%d")
+            else:
+                iso_date = datetime.strptime(raw_date, "%d/%m/%y").strftime("%Y-%m-%d")
+
             results.append({
-                "date": datetime.strptime(date_match.group(), "%d/%m/%y").strftime("%Y-%m-%d"),
+                "date": iso_date,
                 "description": description,
                 "debit": debit,
                 "credit": credit,
                 "balance": balance,
                 "page": page_index + 1,
                 "bank": "Bank Islam",
-                "source_file": source_filename
+                "source_file": source_filename,
             })
 
     return results
