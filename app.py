@@ -133,24 +133,54 @@ if uploaded_files and st.session_state.status == "running":
 
 
 def calculate_monthly_summary(transactions):
-    """
-    Calculate monthly summary from transactions.
-    Bank Islam only: enforce datetime dtype safely.
-    """
     if not transactions:
         return []
-    
+
     df = pd.DataFrame(transactions)
 
-    # -------------------------------
-    # Parse dates
-    # -------------------------------
+    # ---------------------------------------
+    # Normalize date column
+    # ---------------------------------------
     df['date'] = df['date'].astype(str).str.strip()
 
+    # ---------------------------------------
+    # 🔒 BANK ISLAM DATE FIX (CRITICAL)
+    # Fix: "2025 16:00:26-03-13"
+    # ---------------------------------------
+    if 'bank' in df.columns:
+        bank_islam_mask = df['bank'] == 'Bank Islam'
+
+        def fix_bank_islam_date(val):
+            """
+            Converts:
+            2025 16:00:26-03-13
+            → 2025-03-13 16:00:26
+            """
+            if not isinstance(val, str):
+                return val
+
+            # Match broken format
+            m = re.match(
+                r'(\d{4})\s+(\d{2}:\d{2}:\d{2})-(\d{2})-(\d{2})',
+                val
+            )
+            if m:
+                year, time, month, day = m.groups()
+                return f"{year}-{month}-{day} {time}"
+
+            return val
+
+        df.loc[bank_islam_mask, 'date'] = (
+            df.loc[bank_islam_mask, 'date']
+            .apply(fix_bank_islam_date)
+        )
+
+    # ---------------------------------------
+    # Parse datetime (SAFE)
+    # ---------------------------------------
     df['date_parsed'] = pd.to_datetime(
         df['date'],
-        errors='coerce',
-        infer_datetime_format=True
+        errors='coerce'
     )
 
     df = df[df['date_parsed'].notna()]
@@ -159,26 +189,16 @@ def calculate_monthly_summary(transactions):
         st.warning("⚠️ No valid transaction dates found.")
         return []
 
-    # -------------------------------
-    # 🔒 FIX ONLY FOR BANK ISLAM
-    # -------------------------------
-    if 'bank' in df.columns and (df['bank'] == 'Bank Islam').any():
-        bank_islam_mask = df['bank'] == 'Bank Islam'
+    # ---------------------------------------
+    # Month grouping (NO .dt CRASH)
+    # ---------------------------------------
+    df['month_period'] = df['date_parsed'].apply(
+        lambda x: f"{x.year:04d}-{x.month:02d}"
+    )
 
-        # Force datetime again (prevents .dt crash)
-        df.loc[bank_islam_mask, 'date_parsed'] = pd.to_datetime(
-            df.loc[bank_islam_mask, 'date_parsed'],
-            errors='coerce'
-        )
-
-    # -------------------------------
-    # Month grouping (safe)
-    # -------------------------------
-    df['month_period'] = df['date_parsed'].dt.to_period('M').astype(str)
-
-    # -------------------------------
+    # ---------------------------------------
     # Amount cleanup
-    # -------------------------------
+    # ---------------------------------------
     df['debit'] = pd.to_numeric(df['debit'], errors='coerce').fillna(0)
     df['credit'] = pd.to_numeric(df['credit'], errors='coerce').fillna(0)
     df['balance'] = pd.to_numeric(df['balance'], errors='coerce')
@@ -186,22 +206,22 @@ def calculate_monthly_summary(transactions):
     monthly_summary = []
 
     for period, group in df.groupby('month_period', sort=True):
+        group = group.sort_values('date_parsed')
 
         ending_balance = None
-        if not group['balance'].isna().all():
-            group_sorted = group.sort_values('date_parsed')
-            valid_bal = group_sorted['balance'].dropna()
-            ending_balance = round(valid_bal.iloc[-1], 2) if not valid_bal.empty else None
+        valid_bal = group['balance'].dropna()
+        if not valid_bal.empty:
+            ending_balance = round(valid_bal.iloc[-1], 2)
 
         summary = {
             'month': period,
+            'transaction_count': len(group),
             'total_debit': round(group['debit'].sum(), 2),
             'total_credit': round(group['credit'].sum(), 2),
             'net_change': round(group['credit'].sum() - group['debit'].sum(), 2),
             'ending_balance': ending_balance,
             'lowest_balance': round(group['balance'].min(), 2) if not group['balance'].isna().all() else None,
             'highest_balance': round(group['balance'].max(), 2) if not group['balance'].isna().all() else None,
-            'transaction_count': len(group),
             'source_files': ', '.join(sorted(group['source_file'].unique())) if 'source_file' in group.columns else ''
         }
 
