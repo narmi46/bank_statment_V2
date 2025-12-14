@@ -1,5 +1,5 @@
 # bank_rakyat.py
-# Bank Rakyat – Balance-driven parser (Bank Islam standard)
+# Bank Rakyat – Balance-driven parser (2-pass, production safe)
 
 import re
 import fitz
@@ -27,188 +27,111 @@ def parse_date(raw):
 
 
 def extract_opening_balance(text):
-    """
-    Bank Rakyat formats:
-    - Opening Balance -243,353.66
-    - Baki Permulaan -452,862.83
-    """
     patterns = [
         r"Opening Balance\s*([\-]?\d[\d,]*\.\d{2})",
         r"Baki Permulaan\s*([\-]?\d[\d,]*\.\d{2})",
     ]
-
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
         if m:
             return clean_amount(m.group(1))
-
     return None
 
 
 # ---------------------------------------------------------
-# TABLE PARSER (BALANCE-DRIVEN)
+# PASS 1 — Extract RAW rows (date + desc + balance)
 # ---------------------------------------------------------
 
-def parse_with_tables(pdf, source_filename):
-    rows = []
-
-    # 🔴 CRITICAL: extract opening balance from FULL DOCUMENT
-    full_text = ""
-    for p in pdf.pages:
-        full_text += (p.extract_text() or "") + "\n"
-
-    prev_balance = extract_opening_balance(full_text)
+def extract_raw_rows(pdf):
+    raw = []
 
     for page_no, page in enumerate(pdf.pages, start=1):
-        tables = page.extract_tables()
-        if not tables:
-            continue
+        text = page.extract_text() or ""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-        for table in tables:
-            for row in table:
-                if not row:
-                    continue
-
-                row_text = " ".join(str(c) for c in row if c)
-
-                # skip summary rows
-                if re.search(r"(Baki Permulaan|Opening Balance|Baki Penutup)", row_text, re.I):
-                    continue
-
-                date_match = re.search(r"\d{2}/\d{2}/\d{4}", row_text)
-                if not date_match:
-                    continue
-
-                amounts = re.findall(r"[+-]?\d[\d,]*\.\d{2}", row_text)
-                if not amounts:
-                    continue
-
-                balance = clean_amount(amounts[-1])
-                if balance is None:
-                    continue
-
-                iso_date = parse_date(date_match.group())
-                if not iso_date:
-                    continue
-
-                desc = row_text.replace(date_match.group(), "")
-                desc = desc.replace(amounts[-1], "")
-                desc = " ".join(desc.split())
-
-                # 🛡️ SAFETY: ensure first delta is computed correctly
-                debit = credit = 0.0
-                if prev_balance is not None:
-                    delta = round(balance - prev_balance, 2)
-                    if delta > 0:
-                        credit = delta
-                    elif delta < 0:
-                        debit = abs(delta)
-                else:
-                    prev_balance = balance
-                    continue
-
-                prev_balance = balance
-
-                rows.append({
-                    "date": iso_date,
-                    "description": desc,
-                    "debit": debit,
-                    "credit": credit,
-                    "balance": balance,
-                    "page": page_no,
-                    "bank": "Bank Rakyat",
-                    "source_file": source_filename,
-                })
-
-    return rows
-
-
-# ---------------------------------------------------------
-# PyMuPDF FALLBACK (BALANCE-DRIVEN)
-# ---------------------------------------------------------
-
-def parse_with_pymupdf(pdf, source_filename):
-    results = []
-
-    pdf.stream.seek(0)
-    pdf_bytes = pdf.stream.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    # 🔴 FULL DOCUMENT opening balance
-    full_text = ""
-    for i in range(doc.page_count):
-        full_text += doc[i].get_text() + "\n"
-
-    prev_balance = extract_opening_balance(full_text)
-
-    for page_index in range(doc.page_count):
-        page = doc[page_index]
-        words = page.get_text("words")
-
-        rows = {}
-        for x0, y0, x1, y1, text, *_ in words:
-            y = round(y0, 1)
-            rows.setdefault(y, []).append((x0, text))
-
-        for y in sorted(rows):
-            row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
-
-            if re.search(r"(Baki Permulaan|Opening Balance|Baki Penutup)", row_text, re.I):
-                continue
-
-            date_match = re.search(r"\d{2}/\d{2}/\d{4}", row_text)
+        for line in lines:
+            date_match = re.search(r"\d{2}/\d{2}/\d{4}", line)
             if not date_match:
                 continue
 
-            amounts = re.findall(r"[+-]?\d[\d,]*\.\d{2}", row_text)
+            amounts = re.findall(r"[+-]?\d[\d,]*\.\d{2}", line)
             if not amounts:
                 continue
 
             balance = clean_amount(amounts[-1])
-            iso_date = parse_date(date_match.group())
-
-            if balance is None or not iso_date:
+            if balance is None:
                 continue
 
-            desc = row_text.replace(date_match.group(), "")
+            iso_date = parse_date(date_match.group())
+            if not iso_date:
+                continue
+
+            desc = line.replace(date_match.group(), "")
             desc = desc.replace(amounts[-1], "")
             desc = " ".join(desc.split())
 
-            debit = credit = 0.0
-            if prev_balance is not None:
-                delta = round(balance - prev_balance, 2)
-                if delta > 0:
-                    credit = delta
-                elif delta < 0:
-                    debit = abs(delta)
-            else:
-                prev_balance = balance
-                continue
-
-            prev_balance = balance
-
-            results.append({
+            raw.append({
                 "date": iso_date,
                 "description": desc,
-                "debit": debit,
-                "credit": credit,
                 "balance": balance,
-                "page": page_index + 1,
-                "bank": "Bank Rakyat",
-                "source_file": source_filename,
+                "page": page_no,
             })
+
+    return raw
+
+
+# ---------------------------------------------------------
+# PASS 2 — Compute debit / credit safely
+# ---------------------------------------------------------
+
+def apply_balance_delta(raw_rows, opening_balance, source_filename):
+    if not raw_rows:
+        return []
+
+    # Sort by date then page
+    raw_rows.sort(key=lambda x: (x["date"], x["page"]))
+
+    results = []
+    prev_balance = opening_balance
+
+    for row in raw_rows:
+        debit = credit = 0.0
+
+        if prev_balance is not None:
+            delta = round(row["balance"] - prev_balance, 2)
+            if delta > 0:
+                credit = delta
+            elif delta < 0:
+                debit = abs(delta)
+
+        prev_balance = row["balance"]
+
+        results.append({
+            "date": row["date"],
+            "description": row["description"],
+            "debit": debit,
+            "credit": credit,
+            "balance": row["balance"],
+            "page": row["page"],
+            "bank": "Bank Rakyat",
+            "source_file": source_filename,
+        })
 
     return results
 
 
 # ---------------------------------------------------------
-# MAIN ENTRY (STANDARDIZED)
+# MAIN ENTRY
 # ---------------------------------------------------------
 
 def parse_bank_rakyat(pdf, source_filename=""):
-    rows = parse_with_tables(pdf, source_filename)
+    # Extract opening balance from FULL document
+    full_text = ""
+    for p in pdf.pages:
+        full_text += (p.extract_text() or "") + "\n"
 
-    if not rows:
-        rows = parse_with_pymupdf(pdf, source_filename)
+    opening_balance = extract_opening_balance(full_text)
 
-    return rows
+    raw_rows = extract_raw_rows(pdf)
+
+    return apply_balance_delta(raw_rows, opening_balance, source_filename)
