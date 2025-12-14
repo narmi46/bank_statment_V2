@@ -1,86 +1,162 @@
+# bank_islam.py - Standalone Bank Islam Parser (Pandas-safe)
 import re
 from datetime import datetime
-import fitz
 
-DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})")
-AMT_RE = re.compile(r"[\d,]+\.\d{2}")
+# ---------------------------------------------------------
+# YEAR EXTRACTION
+# ---------------------------------------------------------
+
+def extract_year_from_text(text):
+    """
+    Extract year from Bank Islam statement.
+    Handles both 4-digit (2025) and 2-digit (25) year formats.
+    """
+
+    # Pattern 1: STATEMENT DATE : 30/09/25
+    match = re.search(
+        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
+        text,
+        re.IGNORECASE
+    )
+    if match:
+        year_str = match.group(1)
+        if len(year_str) == 4:
+            return year_str
+        elif len(year_str) == 2:
+            return str(2000 + int(year_str))
+
+    # Pattern 2: Date 03/04/2025
+    match = re.search(r'Date\s+(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
+    if match:
+        return match.group(1).split("/")[-1]
+
+    # Pattern 3: From 01/03/2025 To 31/03/2025
+    match = re.search(r'From\s+\d{2}/\d{2}/(\d{4})', text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+# ---------------------------------------------------------
+# HELPER FUNCTIONS
+# ---------------------------------------------------------
+
+def clean_amount(value):
+    """Convert string amount to float safely"""
+    if value in (None, "", "-"):
+        return 0.0
+    try:
+        return float(str(value).replace(",", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def format_date(date_raw, year):
+    """
+    ALWAYS return ISO date (YYYY-MM-DD)
+    Guaranteed pandas-safe for .dt accessor
+    """
+    if not date_raw:
+        return f"{year}-01-01"
+
+    date_raw = str(date_raw).strip()
+
+    # DD/MM/YYYY
+    try:
+        return datetime.strptime(date_raw, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # DD/MM (missing year)
+    try:
+        return datetime.strptime(f"{date_raw}/{year}", "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # Already ISO?
+    try:
+        return datetime.fromisoformat(date_raw).strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # Absolute fallback (never crash app)
+    return f"{year}-01-01"
+
+
+# ---------------------------------------------------------
+# MAIN PARSER
+# ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    results = []
+    """
+    Parse Bank Islam PDF statements.
+    Returns list of transaction dictionaries.
+    """
 
-    pdf.stream.seek(0)
-    pdf_bytes = pdf.stream.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    all_transactions = []
+    detected_year = None
 
-    # ✅ 1) Initialize previous_balance using Opening Balance if present
-    full_text = "\n".join(doc[i].get_text() for i in range(min(2, doc.page_count)))
-    opening_balance = None
+    # Extract year from first few pages
+    for page in pdf.pages[:3]:
+        text = page.extract_text() or ""
+        detected_year = extract_year_from_text(text)
+        if detected_year:
+            break
 
-    m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", full_text, re.IGNORECASE)
-    if m:
-        opening_balance = float(m.group(1).replace(",", ""))
-    else:
-        # fallback for other Bank Islam formats: BAL B/F
-        m2 = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", full_text, re.IGNORECASE)
-        if m2:
-            opening_balance = float(m2.group(1).replace(",", ""))
+    # Fallback to current year
+    if not detected_year:
+        detected_year = str(datetime.now().year)
 
-    previous_balance = opening_balance  # <-- THIS fixes first txn debit/credit
+    # Process pages
+    for page_num, page in enumerate(pdf.pages, start=1):
+        tables = page.extract_tables()
+        if not tables:
+            continue
 
-    for page_index in range(doc.page_count):
-        page = doc[page_index]
-        words = page.get_text("words")
-
-        rows = {}
-        for x0, y0, x1, y1, text, *_ in words:
-            y = round(y0, 1)
-            rows.setdefault(y, []).append((x0, text))
-
-        for y in sorted(rows):
-            row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
-
-            # ✅ 2) Support DD/MM/YY and DD/MM/YYYY
-            date_match = DATE_RE.search(row_text)
-            if not date_match:
+        for table in tables:
+            if not table or len(table) < 2:
                 continue
 
-            amounts = AMT_RE.findall(row_text)
-            if not amounts:
-                continue
+            # Skip header
+            for row in table[1:]:
+                if len(row) < 10:
+                    continue
 
-            balance = float(amounts[-1].replace(",", ""))
+                (
+                    no,
+                    date_raw,
+                    eft_no,
+                    code,
+                    desc,
+                    ref_no,
+                    branch,
+                    debit_raw,
+                    credit_raw,
+                    balance_raw
+                ) = row[:10]
 
-            # description = same line excluding date + balance only
-            description = row_text.replace(date_match.group(), "")
-            description = description.replace(amounts[-1], "")
-            description = " ".join(description.split())
+                # Skip totals / invalid rows
+                if not date_raw or "Total" in str(no):
+                    continue
 
-            debit = credit = 0.0
-            if previous_balance is not None:
-                delta = round(balance - previous_balance, 2)
-                if delta > 0:
-                    credit = delta
-                elif delta < 0:
-                    debit = abs(delta)
+                date_fmt = format_date(date_raw, detected_year)
 
-            previous_balance = balance
+                description = " ".join(str(desc).split()) if desc else ""
 
-            # ✅ parse date with both formats
-            raw_date = date_match.group()
-            if len(raw_date.split("/")[-1]) == 4:
-                iso_date = datetime.strptime(raw_date, "%d/%m/%Y").strftime("%Y-%m-%d")
-            else:
-                iso_date = datetime.strptime(raw_date, "%d/%m/%y").strftime("%Y-%m-%d")
+                debit = clean_amount(debit_raw)
+                credit = clean_amount(credit_raw)
+                balance = clean_amount(balance_raw)
 
-            results.append({
-                "date": iso_date,
-                "description": description,
-                "debit": debit,
-                "credit": credit,
-                "balance": balance,
-                "page": page_index + 1,
-                "bank": "Bank Islam",
-                "source_file": source_filename,
-            })
+                all_transactions.append({
+                    "date": date_fmt,                  # ✅ ISO date
+                    "description": description,
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                    "page": page_num,
+                    "source_file": source_filename,
+                    "bank": "Bank Islam"
+                })
 
-    return results
+    return all_transactions
