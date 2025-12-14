@@ -6,12 +6,18 @@ import re
 # ---------------------------------------------------------
 
 def extract_year_from_text(text):
-    """Extract year from Public Bank statement"""
+    """
+    Extract year from Public Bank statement.
+    Handles both 4-digit (2024) and 2-digit (24) year formats.
+    """
     patterns = [
-        r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}/\d{1,2}/(\d{4})',
+        # STATEMENT DATE format
+        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
+        r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
+        r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
         r'(\d{4})\s+Statement',
-        r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}/\d{1,2}/(\d{4})',
         r'(\d{2})/(\d{2})/(\d{4})',  # DD/MM/YYYY
+        r'(\d{2})/(\d{2})/(\d{2})(?!\d)',  # DD/MM/YY
     ]
     
     for pattern in patterns:
@@ -19,9 +25,20 @@ def extract_year_from_text(text):
         if match:
             groups = match.groups()
             for group in groups:
-                if group and len(group) == 4 and group.isdigit():
+                if not group or not group.isdigit():
+                    continue
+                
+                # Handle 4-digit year
+                if len(group) == 4:
                     year = int(group)
                     if 2000 <= year <= 2100:
+                        return str(year)
+                
+                # Handle 2-digit year
+                elif len(group) == 2:
+                    year_2digit = int(group)
+                    if 0 <= year_2digit <= 99:
+                        year = 2000 + year_2digit
                         return str(year)
     
     return None
