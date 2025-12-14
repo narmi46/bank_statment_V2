@@ -130,17 +130,100 @@ def parse_row(text, year, page_num, source_file):
 # ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    """
-    pdf argument is ignored — we reopen using PyMuPDF
-    """
-    doc = fitz.open(stream=pdf.stream.read(), filetype="pdf")
+    import fitz  # PyMuPDF
+    import re
+    from datetime import datetime
+
     all_rows = []
 
-    year = detect_year(doc[0].get_text())
+    # 🔑 IMPORTANT: rewind stream before reading
+    pdf.stream.seek(0)
+    pdf_bytes = pdf.stream.read()
 
-    for i, page in enumerate(doc, start=1):
-        rows = extract_rows(page)
-        for r in rows:
-            all_rows.append(parse_row(r, year, i, source_filename))
+    if not pdf_bytes:
+        raise ValueError("PDF stream is empty")
+
+    # Open fresh document with PyMuPDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    if doc.page_count == 0:
+        raise ValueError("No pages found in PDF")
+
+    # Detect year from first page
+    first_text = doc[0].get_text()
+    year_match = re.search(
+        r"(STATEMENT DATE|TARIKH PENYATA).*?(\d{2}/\d{2}/(\d{2,4}))",
+        first_text,
+        re.IGNORECASE,
+    )
+    if year_match:
+        y = year_match.group(3)
+        year = y if len(y) == 4 else str(2000 + int(y))
+    else:
+        year = str(datetime.now().year)
+
+    # --- helper functions ---
+    def clean_amount(v):
+        try:
+            return float(v.replace(",", ""))
+        except Exception:
+            return None
+
+    def format_date(d):
+        for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(d, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        return f"{year}-01-01"
+
+    # --- parse pages ---
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        words = page.get_text("words")
+
+        rows = {}
+        for x0, y0, x1, y1, text, *_ in words:
+            y = round(y0, 1)
+            rows.setdefault(y, []).append((x0, text))
+
+        for y in sorted(rows):
+            row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
+
+            # must contain a date and an amount
+            if not re.search(r"\d{1,2}/\d{1,2}/\d{2}", row_text):
+                continue
+            if not re.search(r"[\d,]+\.\d{2}", row_text):
+                continue
+
+            date_match = re.search(r"\d{1,2}/\d{1,2}/\d{2}", row_text)
+            amounts = re.findall(r"[\d,]+\.\d{2}", row_text)
+            amounts = [clean_amount(a) for a in amounts if clean_amount(a) is not None]
+
+            credit = balance = None
+            if len(amounts) >= 2:
+                credit = amounts[-2]
+                balance = amounts[-1]
+            elif len(amounts) == 1:
+                credit = amounts[0]
+
+            desc = row_text
+            if date_match:
+                desc = desc.replace(date_match.group(), "")
+            for a in re.findall(r"[\d,]+\.\d{2}", row_text):
+                desc = desc.replace(a, "")
+            desc = " ".join(desc.split())
+
+            all_rows.append({
+                "date": format_date(date_match.group()),
+                "description": desc,
+                "debit": 0.0,
+                "credit": credit or 0.0,
+                "balance": balance,
+                "page": page_num + 1,
+                "bank": "Bank Islam",
+                "source_file": source_filename,
+                "parse_method": "pymupdf",
+            })
 
     return all_rows
