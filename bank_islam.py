@@ -1,5 +1,8 @@
 # bank_islam.py
-# Bank Islam – Integrated v1 (table) + simple balance parser
+# Bank Islam – Integrated v2
+# - Robust opening balance extraction
+# - Correct first debit/credit
+# - Table parser + PyMuPDF fallback
 
 import re
 import fitz
@@ -26,23 +29,36 @@ def parse_date(raw):
     return None
 
 
+def extract_opening_balance(text):
+    """
+    Supports:
+    - Opening Balance (MYR) 55,142.10
+    - BAL B/F 12,289.62
+    """
+    patterns = [
+        r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})",
+        r"BAL\s*B/F\s*([\d,]+\.\d{2})",
+        r"BALANCE\s*B/F\s*([\d,]+\.\d{2})",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return clean_amount(m.group(1))
+
+    return None
+
+
 # ---------------------------------------------------------
-# v1-style TABLE PARSER (but balance-driven)
+# v1-style TABLE PARSER (balance-driven)
 # ---------------------------------------------------------
 
 def parse_with_tables(pdf, source_filename):
     rows = []
 
-    # detect year + opening balance
-    full_text = ""
-    for p in pdf.pages[:2]:
-        full_text += (p.extract_text() or "") + "\n"
-
-    opening_balance = None
-    m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", full_text)
-    if m:
-        opening_balance = clean_amount(m.group(1))
-
+    # --- extract opening balance from FIRST PAGE ---
+    first_page_text = pdf.pages[0].extract_text() or ""
+    opening_balance = extract_opening_balance(first_page_text)
     prev_balance = opening_balance
 
     for page_no, page in enumerate(pdf.pages, start=1):
@@ -52,12 +68,16 @@ def parse_with_tables(pdf, source_filename):
 
         for table in tables:
             for row in table:
-                if not row or len(row) < 5:
+                if not row or len(row) < 3:
                     continue
 
                 row_text = " ".join(str(c) for c in row if c)
 
-                date_match = re.search(r"\d{1,2}/\d{1,2}/\d{4}", row_text)
+                # Skip BAL B/F row (already used as opening balance)
+                if re.search(r"\bBAL\s*B/F\b", row_text, re.IGNORECASE):
+                    continue
+
+                date_match = re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", row_text)
                 if not date_match:
                     continue
 
@@ -73,7 +93,8 @@ def parse_with_tables(pdf, source_filename):
                 if not iso_date:
                     continue
 
-                desc = row_text.replace(date_match.group(), "")
+                desc = row_text
+                desc = desc.replace(date_match.group(), "")
                 desc = desc.replace(amounts[-1], "")
                 desc = " ".join(desc.split())
 
@@ -102,7 +123,7 @@ def parse_with_tables(pdf, source_filename):
 
 
 # ---------------------------------------------------------
-# PyMuPDF FALLBACK (simple version)
+# PyMuPDF FALLBACK (balance-driven)
 # ---------------------------------------------------------
 
 def parse_with_pymupdf(pdf, source_filename):
@@ -112,7 +133,9 @@ def parse_with_pymupdf(pdf, source_filename):
     pdf_bytes = pdf.stream.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    prev_balance = None
+    # --- opening balance from first page ---
+    first_page_text = doc[0].get_text()
+    prev_balance = extract_opening_balance(first_page_text)
 
     for page_index in range(doc.page_count):
         page = doc[page_index]
@@ -125,6 +148,9 @@ def parse_with_pymupdf(pdf, source_filename):
 
         for y in sorted(rows):
             row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
+
+            if re.search(r"\bBAL\s*B/F\b", row_text, re.IGNORECASE):
+                continue
 
             date_match = re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", row_text)
             if not date_match:
@@ -140,7 +166,8 @@ def parse_with_pymupdf(pdf, source_filename):
             if balance is None or not iso_date:
                 continue
 
-            desc = row_text.replace(date_match.group(), "")
+            desc = row_text
+            desc = desc.replace(date_match.group(), "")
             desc = desc.replace(amounts[-1], "")
             desc = " ".join(desc.split())
 
@@ -173,10 +200,10 @@ def parse_with_pymupdf(pdf, source_filename):
 # ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    # 1️⃣ try v1-style table parsing
+    # 1️⃣ Try table-based parsing first
     rows = parse_with_tables(pdf, source_filename)
 
-    # 2️⃣ fallback if table parsing fails
+    # 2️⃣ Fallback to PyMuPDF if tables fail
     if not rows:
         rows = parse_with_pymupdf(pdf, source_filename)
 
