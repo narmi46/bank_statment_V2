@@ -1,13 +1,21 @@
 # bank_islam.py
-# FINAL – Bank Islam balance-driven parser (first row FIXED)
+# Bank Islam – Ledger-Driven, Balance-First Parser (FINAL)
 
 import re
-import fitz
+import fitz  # PyMuPDF
 from datetime import datetime
+
+# ---------------------------------------------------------
+# Regex
+# ---------------------------------------------------------
 
 DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})")
 AMT_RE = re.compile(r"[\d,]+\.\d{2}")
 
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 
 def clean_amount(v):
     try:
@@ -26,158 +34,116 @@ def parse_date(raw):
 
 
 # ---------------------------------------------------------
-# TABLE PARSER (v1-style, balance-based)
+# PHASE 1 — EXTRACT FACTS ONLY (date, desc, balance)
 # ---------------------------------------------------------
 
-def parse_with_tables(pdf, source_filename):
-    results = []
-    prev_balance = None
-
-    for page_no, page in enumerate(pdf.pages, start=1):
-        tables = page.extract_tables()
-        if not tables:
-            continue
-
-        for table in tables:
-            for row in table:
-                row_text = " ".join(str(c) for c in row if c)
-
-                date_match = DATE_RE.search(row_text)
-                if not date_match:
-                    continue
-
-                amounts = AMT_RE.findall(row_text)
-                if not amounts:
-                    continue
-
-                balance = clean_amount(amounts[-1])
-                date = parse_date(date_match.group())
-                if balance is None or not date:
-                    continue
-
-                desc = row_text.replace(date_match.group(), "")
-                desc = desc.replace(amounts[-1], "")
-                desc = " ".join(desc.split())
-
-                debit = credit = 0.0
-                if prev_balance is not None:
-                    delta = round(balance - prev_balance, 2)
-                    if delta > 0:
-                        credit = delta
-                    elif delta < 0:
-                        debit = abs(delta)
-
-                prev_balance = balance
-
-                results.append({
-                    "date": date,
-                    "description": desc,
-                    "debit": debit,
-                    "credit": credit,
-                    "balance": balance,
-                    "page": page_no,
-                    "bank": "Bank Islam",
-                    "source_file": source_filename,
-                })
-
-    return results
-
-
-# ---------------------------------------------------------
-# PyMuPDF FALLBACK PARSER
-# ---------------------------------------------------------
-
-def parse_with_pymupdf(pdf, source_filename):
-    results = []
+def extract_rows(pdf, source_filename):
+    rows = []
 
     pdf.stream.seek(0)
     doc = fitz.open(stream=pdf.stream.read(), filetype="pdf")
-
-    prev_balance = None
 
     for page_index in range(doc.page_count):
         page = doc[page_index]
         words = page.get_text("words")
 
-        rows = {}
+        # rebuild rows by Y-position
+        lines = {}
         for x0, y0, x1, y1, text, *_ in words:
             y = round(y0, 1)
-            rows.setdefault(y, []).append((x0, text))
+            lines.setdefault(y, []).append((x0, text))
 
-        for y in sorted(rows):
-            row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
+        for y in sorted(lines):
+            line = " ".join(t[1] for t in sorted(lines[y], key=lambda x: x[0]))
 
-            date_match = DATE_RE.search(row_text)
-            if not date_match:
-                continue
+            date_match = DATE_RE.search(line)
+            amounts = AMT_RE.findall(line)
 
-            amounts = AMT_RE.findall(row_text)
-            if not amounts:
+            if not date_match or not amounts:
                 continue
 
             balance = clean_amount(amounts[-1])
             date = parse_date(date_match.group())
+
             if balance is None or not date:
                 continue
 
-            desc = row_text.replace(date_match.group(), "")
+            desc = line.replace(date_match.group(), "")
             desc = desc.replace(amounts[-1], "")
             desc = " ".join(desc.split())
 
-            debit = credit = 0.0
-            if prev_balance is not None:
-                delta = round(balance - prev_balance, 2)
-                if delta > 0:
-                    credit = delta
-                elif delta < 0:
-                    debit = abs(delta)
-
-            prev_balance = balance
-
-            results.append({
+            rows.append({
                 "date": date,
                 "description": desc,
-                "debit": debit,
-                "credit": credit,
                 "balance": balance,
                 "page": page_index + 1,
                 "bank": "Bank Islam",
                 "source_file": source_filename,
+                # placeholders
+                "debit": 0.0,
+                "credit": 0.0,
             })
 
-    return results
+    return rows
 
 
 # ---------------------------------------------------------
-# 🔥 FINAL FIX – FIRST TRANSACTION PATCH
+# PHASE 2 — LEDGER ENGINE (THE IMPORTANT PART)
 # ---------------------------------------------------------
 
-def fix_first_transaction(results):
-    if len(results) < 2:
-        return
+def apply_ledger_rules(rows):
+    if not rows:
+        return rows
 
-    first = results[0]
-    second = results[1]
+    # --- Rule 1: Balance Delta (normal case)
+    for i in range(1, len(rows)):
+        prev = rows[i - 1]["balance"]
+        curr = rows[i]["balance"]
+        delta = round(curr - prev, 2)
 
-    if first["debit"] == 0.0 and first["credit"] == 0.0:
-        delta = round(second["balance"] - first["balance"], 2)
         if delta > 0:
-            first["credit"] = abs(delta)
+            rows[i]["credit"] = delta
         elif delta < 0:
-            first["debit"] = abs(delta)
+            rows[i]["debit"] = abs(delta)
+
+    # --- Rule 2: First row inference (BAL B/F not present)
+    if len(rows) >= 2:
+        first = rows[0]
+        second = rows[1]
+
+        if first["debit"] == 0.0 and first["credit"] == 0.0:
+            delta = round(second["balance"] - first["balance"], 2)
+            if delta > 0:
+                first["credit"] = abs(delta)
+            elif delta < 0:
+                first["debit"] = abs(delta)
+
+    # --- Rule 3: Single-transaction statement
+    if len(rows) == 1:
+        row = rows[0]
+        m = AMT_RE.search(row["description"])
+        if m:
+            amt = clean_amount(m.group())
+            if amt is not None:
+                # service charges & advice are debit
+                if any(k in row["description"].upper()
+                       for k in ["CHARGE", "SERVICE", "ADVICE", "FEE"]):
+                    row["debit"] = amt
+                else:
+                    row["credit"] = amt
+
+    return rows
 
 
 # ---------------------------------------------------------
-# MAIN ENTRY
+# MAIN ENTRY POINT
 # ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    results = parse_with_tables(pdf, source_filename)
+    # Phase 1: extract facts only
+    rows = extract_rows(pdf, source_filename)
 
-    if not results:
-        results = parse_with_pymupdf(pdf, source_filename)
+    # Phase 2: apply accounting rules
+    rows = apply_ledger_rules(rows)
 
-    # 🔧 APPLY FINAL FIX
-    fix_first_transaction(results)
-
-    return results
+    return rows
