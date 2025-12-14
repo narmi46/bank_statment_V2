@@ -132,45 +132,67 @@ if uploaded_files and st.session_state.status == "running":
     st.session_state.results = all_tx
 
 
-# ---------------------------------------------------
-# CALCULATE MONTHLY SUMMARY
-# ---------------------------------------------------
 def calculate_monthly_summary(transactions):
     """
     Calculate monthly summary from transactions.
-    Groups by year-month extracted from transaction dates.
+    Bank Islam only: enforce datetime dtype safely.
     """
     if not transactions:
         return []
     
     df = pd.DataFrame(transactions)
-    
+
+    # -------------------------------
     # Parse dates
-    df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
-    df = df.dropna(subset=['date_parsed'])
-    
+    # -------------------------------
+    df['date'] = df['date'].astype(str).str.strip()
+
+    df['date_parsed'] = pd.to_datetime(
+        df['date'],
+        errors='coerce',
+        infer_datetime_format=True
+    )
+
+    df = df[df['date_parsed'].notna()]
+
     if df.empty:
         st.warning("⚠️ No valid transaction dates found.")
         return []
-    
-    # Create month grouping
-    df['month_period'] = df['date_parsed'].dt.strftime('%Y-%m')
-    
-    # Convert amounts to numeric
+
+    # -------------------------------
+    # 🔒 FIX ONLY FOR BANK ISLAM
+    # -------------------------------
+    if 'bank' in df.columns and (df['bank'] == 'Bank Islam').any():
+        bank_islam_mask = df['bank'] == 'Bank Islam'
+
+        # Force datetime again (prevents .dt crash)
+        df.loc[bank_islam_mask, 'date_parsed'] = pd.to_datetime(
+            df.loc[bank_islam_mask, 'date_parsed'],
+            errors='coerce'
+        )
+
+    # -------------------------------
+    # Month grouping (safe)
+    # -------------------------------
+    df['month_period'] = df['date_parsed'].dt.to_period('M').astype(str)
+
+    # -------------------------------
+    # Amount cleanup
+    # -------------------------------
     df['debit'] = pd.to_numeric(df['debit'], errors='coerce').fillna(0)
     df['credit'] = pd.to_numeric(df['credit'], errors='coerce').fillna(0)
     df['balance'] = pd.to_numeric(df['balance'], errors='coerce')
-    
+
     monthly_summary = []
-    
+
     for period, group in df.groupby('month_period', sort=True):
-        # Get ending balance (last transaction's balance in the month)
+
         ending_balance = None
         if not group['balance'].isna().all():
             group_sorted = group.sort_values('date_parsed')
-            last_balance = group_sorted['balance'].dropna().iloc[-1] if len(group_sorted['balance'].dropna()) > 0 else None
-            ending_balance = round(last_balance, 2) if last_balance is not None else None
-        
+            valid_bal = group_sorted['balance'].dropna()
+            ending_balance = round(valid_bal.iloc[-1], 2) if not valid_bal.empty else None
+
         summary = {
             'month': period,
             'total_debit': round(group['debit'].sum(), 2),
@@ -182,8 +204,9 @@ def calculate_monthly_summary(transactions):
             'transaction_count': len(group),
             'source_files': ', '.join(sorted(group['source_file'].unique())) if 'source_file' in group.columns else ''
         }
+
         monthly_summary.append(summary)
-    
+
     return sorted(monthly_summary, key=lambda x: x['month'])
 
 
