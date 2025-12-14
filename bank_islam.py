@@ -1,5 +1,5 @@
 # bank_islam.py
-# Bank Islam – Ledger-Driven, Balance-First Parser (FINAL)
+# FINAL – Bank Islam Ledger-Based Parser (BAL B/F anchored)
 
 import re
 import fitz  # PyMuPDF
@@ -34,7 +34,23 @@ def parse_date(raw):
 
 
 # ---------------------------------------------------------
-# PHASE 1 — EXTRACT FACTS ONLY (date, desc, balance)
+# Extract BAL B/F (OPENING BALANCE)
+# ---------------------------------------------------------
+
+def extract_opening_balance(pdf):
+    for page in pdf.pages[:1]:
+        text = page.extract_text() or ""
+        m = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", text, re.I)
+        if m:
+            return clean_amount(m.group(1))
+        m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", text, re.I)
+        if m:
+            return clean_amount(m.group(1))
+    return None
+
+
+# ---------------------------------------------------------
+# PHASE 1 — Extract FACTS ONLY (no debit/credit logic)
 # ---------------------------------------------------------
 
 def extract_rows(pdf, source_filename):
@@ -47,7 +63,7 @@ def extract_rows(pdf, source_filename):
         page = doc[page_index]
         words = page.get_text("words")
 
-        # rebuild rows by Y-position
+        # rebuild lines by Y position
         lines = {}
         for x0, y0, x1, y1, text, *_ in words:
             y = round(y0, 1)
@@ -79,7 +95,6 @@ def extract_rows(pdf, source_filename):
                 "page": page_index + 1,
                 "bank": "Bank Islam",
                 "source_file": source_filename,
-                # placeholders
                 "debit": 0.0,
                 "credit": 0.0,
             })
@@ -88,62 +103,75 @@ def extract_rows(pdf, source_filename):
 
 
 # ---------------------------------------------------------
-# PHASE 2 — LEDGER ENGINE (THE IMPORTANT PART)
+# PHASE 2 — Inject BAL B/F as virtual ledger row
+# ---------------------------------------------------------
+
+def inject_opening_balance(rows, opening_balance):
+    if opening_balance is None or not rows:
+        return rows
+
+    virtual = {
+        "date": rows[0]["date"],
+        "description": "BAL B/F",
+        "balance": opening_balance,
+        "debit": 0.0,
+        "credit": 0.0,
+        "page": rows[0]["page"],
+        "bank": rows[0]["bank"],
+        "source_file": rows[0]["source_file"],
+        "_virtual": True,
+    }
+
+    return [virtual] + rows
+
+
+# ---------------------------------------------------------
+# PHASE 3 — Ledger engine (THE TRUTH)
 # ---------------------------------------------------------
 
 def apply_ledger_rules(rows):
-    if not rows:
-        return rows
-
-    # --- Rule 1: Balance Delta (normal case)
     for i in range(1, len(rows)):
-        prev = rows[i - 1]["balance"]
-        curr = rows[i]["balance"]
-        delta = round(curr - prev, 2)
+        prev_bal = rows[i - 1]["balance"]
+        curr_bal = rows[i]["balance"]
+        delta = round(curr_bal - prev_bal, 2)
 
         if delta > 0:
             rows[i]["credit"] = delta
         elif delta < 0:
             rows[i]["debit"] = abs(delta)
 
-    # --- Rule 2: First row inference (BAL B/F not present)
-    if len(rows) >= 2:
-        first = rows[0]
-        second = rows[1]
-
-        if first["debit"] == 0.0 and first["credit"] == 0.0:
-            delta = round(second["balance"] - first["balance"], 2)
-            if delta > 0:
-                first["credit"] = abs(delta)
-            elif delta < 0:
-                first["debit"] = abs(delta)
-
-    # --- Rule 3: Single-transaction statement
-    if len(rows) == 1:
-        row = rows[0]
-        m = AMT_RE.search(row["description"])
-        if m:
-            amt = clean_amount(m.group())
-            if amt is not None:
-                # service charges & advice are debit
-                if any(k in row["description"].upper()
-                       for k in ["CHARGE", "SERVICE", "ADVICE", "FEE"]):
-                    row["debit"] = amt
-                else:
-                    row["credit"] = amt
-
     return rows
 
 
 # ---------------------------------------------------------
-# MAIN ENTRY POINT
+# PHASE 4 — Remove virtual row
+# ---------------------------------------------------------
+
+def remove_virtual_rows(rows):
+    return [r for r in rows if not r.get("_virtual")]
+
+
+# ---------------------------------------------------------
+# MAIN ENTRY
 # ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    # Phase 1: extract facts only
+    # 1️⃣ Extract raw rows
     rows = extract_rows(pdf, source_filename)
 
-    # Phase 2: apply accounting rules
+    if not rows:
+        return rows
+
+    # 2️⃣ Extract opening balance
+    opening_balance = extract_opening_balance(pdf)
+
+    # 3️⃣ Inject BAL B/F as ledger anchor
+    rows = inject_opening_balance(rows, opening_balance)
+
+    # 4️⃣ Apply accounting truth
     rows = apply_ledger_rules(rows)
+
+    # 5️⃣ Remove virtual BAL B/F row
+    rows = remove_virtual_rows(rows)
 
     return rows
