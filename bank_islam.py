@@ -1,10 +1,20 @@
 # bank_islam.py
-# Bank Islam – Simple, Robust, Balance-Based Parser
-# Supports ALL known Bank Islam statement formats
+# Bank Islam – SIMPLE, BALANCE-DRIVEN PARSER
+# ✔ Supports all known Bank Islam formats
+# ✔ Fixes first debit/credit ALWAYS
+# ✔ Minimal fields only (as requested)
 
 import re
 import fitz  # PyMuPDF
 from datetime import datetime
+
+
+# ---------------------------------------------------------
+# Regex
+# ---------------------------------------------------------
+
+DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})")
+AMT_RE = re.compile(r"[\d,]+\.\d{2}")
 
 
 # ---------------------------------------------------------
@@ -27,49 +37,41 @@ def parse_date(raw):
     return None
 
 
-DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})")
-AMT_RE = re.compile(r"[\d,]+\.\d{2}")
-
-
 # ---------------------------------------------------------
-# Extract opening balance (BAL B/F or Opening Balance)
+# Opening balance extraction
 # ---------------------------------------------------------
 
-def extract_opening_balance_from_pdfplumber(pdf):
+def extract_opening_balance_pdfplumber(pdf):
     for page in pdf.pages[:1]:
         text = page.extract_text() or ""
-        m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+        m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", text, re.I)
         if m:
             return clean_amount(m.group(1))
-
-        m = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+        m = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", text, re.I)
         if m:
             return clean_amount(m.group(1))
-
     return None
 
 
-def extract_opening_balance_from_pymupdf(doc):
+def extract_opening_balance_pymupdf(doc):
     text = doc[0].get_text()
-    m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", text, re.I)
     if m:
         return clean_amount(m.group(1))
-
-    m = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    m = re.search(r"BAL\s+B/F\s*([\d,]+\.\d{2})", text, re.I)
     if m:
         return clean_amount(m.group(1))
-
     return None
 
 
 # ---------------------------------------------------------
-# v1-style TABLE PARSER (pdfplumber)
+# Table-based parser (v1 logic, but balance-driven)
 # ---------------------------------------------------------
 
 def parse_with_tables(pdf, source_filename):
     results = []
 
-    opening_balance = extract_opening_balance_from_pdfplumber(pdf)
+    opening_balance = extract_opening_balance_pdfplumber(pdf)
     previous_balance = opening_balance
 
     for page_no, page in enumerate(pdf.pages, start=1):
@@ -93,14 +95,10 @@ def parse_with_tables(pdf, source_filename):
                     continue
 
                 balance = clean_amount(amounts[-1])
-                if balance is None:
-                    continue
-
                 iso_date = parse_date(date_match.group())
-                if not iso_date:
+                if balance is None or not iso_date:
                     continue
 
-                # description = same line only
                 desc = row_text.replace(date_match.group(), "")
                 desc = desc.replace(amounts[-1], "")
                 desc = " ".join(desc.split())
@@ -130,7 +128,7 @@ def parse_with_tables(pdf, source_filename):
 
 
 # ---------------------------------------------------------
-# PyMuPDF FALLBACK PARSER (word-based, simple)
+# PyMuPDF fallback parser (word-based)
 # ---------------------------------------------------------
 
 def parse_with_pymupdf(pdf, source_filename):
@@ -140,7 +138,7 @@ def parse_with_pymupdf(pdf, source_filename):
     pdf_bytes = pdf.stream.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    opening_balance = extract_opening_balance_from_pymupdf(doc)
+    opening_balance = extract_opening_balance_pymupdf(doc)
     previous_balance = opening_balance
 
     for page_index in range(doc.page_count):
@@ -164,11 +162,8 @@ def parse_with_pymupdf(pdf, source_filename):
                 continue
 
             balance = clean_amount(amounts[-1])
-            if balance is None:
-                continue
-
             iso_date = parse_date(date_match.group())
-            if not iso_date:
+            if balance is None or not iso_date:
                 continue
 
             desc = row_text.replace(date_match.group(), "")
@@ -200,18 +195,41 @@ def parse_with_pymupdf(pdf, source_filename):
 
 
 # ---------------------------------------------------------
+# 🔧 FINAL FIX: ensure FIRST transaction gets debit/credit
+# ---------------------------------------------------------
+
+def fix_first_transaction(results, opening_balance):
+    if not results or opening_balance is None:
+        return
+
+    first = results[0]
+    if first["debit"] == 0.0 and first["credit"] == 0.0:
+        delta = round(first["balance"] - opening_balance, 2)
+        if delta > 0:
+            first["credit"] = delta
+        elif delta < 0:
+            first["debit"] = abs(delta)
+
+
+# ---------------------------------------------------------
 # MAIN ENTRY POINT
 # ---------------------------------------------------------
 
 def parse_bank_islam(pdf, source_filename=""):
-    """
-    1) Try table-based parsing (v1 logic)
-    2) If empty → fallback to PyMuPDF
-    """
+    # 1️⃣ Try table-based parsing
+    results = parse_with_tables(pdf, source_filename)
 
-    rows = parse_with_tables(pdf, source_filename)
+    opening_balance = extract_opening_balance_pdfplumber(pdf)
 
-    if not rows:
-        rows = parse_with_pymupdf(pdf, source_filename)
+    # 2️⃣ Fallback to PyMuPDF if needed
+    if not results:
+        results = parse_with_pymupdf(pdf, source_filename)
+        pdf.stream.seek(0)
+        pdf_bytes = pdf.stream.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        opening_balance = extract_opening_balance_pymupdf(doc)
 
-    return rows
+    # 3️⃣ 🔥 FIX FIRST TRANSACTION (THE BUG YOU HIT)
+    fix_first_transaction(results, opening_balance)
+
+    return results
