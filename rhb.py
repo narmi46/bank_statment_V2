@@ -193,3 +193,7 @@ def parse_rhb_pdf(pdf):
         all_transactions.extend(parse_page(text, page_num, year))
 
     return all_transactions
+
+# Backward compatibility
+def parse_transactions_rhb(pdf):
+    return parse_rhb_pdf(pdf)
