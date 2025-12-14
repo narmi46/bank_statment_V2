@@ -17,3 +17,4 @@ openpyxl>=3.0.0
 # PDF processing dependencies
 pdfminer.six>=20221105
 cryptography>=41.0.0
+pymupdf
