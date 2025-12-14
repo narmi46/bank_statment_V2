@@ -1,162 +1,183 @@
-# bank_islam.py - Standalone Bank Islam Parser (Pandas-safe)
+# bank_islam.py
+# Bank Islam – Integrated v1 (table) + simple balance parser
+
 import re
+import fitz
 from datetime import datetime
 
+
 # ---------------------------------------------------------
-# YEAR EXTRACTION
+# helpers
 # ---------------------------------------------------------
 
-def extract_year_from_text(text):
-    """
-    Extract year from Bank Islam statement.
-    Handles both 4-digit (2025) and 2-digit (25) year formats.
-    """
+def clean_amount(val):
+    try:
+        return float(str(val).replace(",", "").strip())
+    except Exception:
+        return None
 
-    # Pattern 1: STATEMENT DATE : 30/09/25
-    match = re.search(
-        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        year_str = match.group(1)
-        if len(year_str) == 4:
-            return year_str
-        elif len(year_str) == 2:
-            return str(2000 + int(year_str))
 
-    # Pattern 2: Date 03/04/2025
-    match = re.search(r'Date\s+(\d{2}/\d{2}/\d{4})', text, re.IGNORECASE)
-    if match:
-        return match.group(1).split("/")[-1]
-
-    # Pattern 3: From 01/03/2025 To 31/03/2025
-    match = re.search(r'From\s+\d{2}/\d{2}/(\d{4})', text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-
+def parse_date(raw):
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
     return None
 
 
 # ---------------------------------------------------------
-# HELPER FUNCTIONS
+# v1-style TABLE PARSER (but balance-driven)
 # ---------------------------------------------------------
 
-def clean_amount(value):
-    """Convert string amount to float safely"""
-    if value in (None, "", "-"):
-        return 0.0
-    try:
-        return float(str(value).replace(",", "").strip())
-    except ValueError:
-        return 0.0
+def parse_with_tables(pdf, source_filename):
+    rows = []
 
+    # detect year + opening balance
+    full_text = ""
+    for p in pdf.pages[:2]:
+        full_text += (p.extract_text() or "") + "\n"
 
-def format_date(date_raw, year):
-    """
-    ALWAYS return ISO date (YYYY-MM-DD)
-    Guaranteed pandas-safe for .dt accessor
-    """
-    if not date_raw:
-        return f"{year}-01-01"
+    opening_balance = None
+    m = re.search(r"Opening Balance\s*\(MYR\)\s*([\d,]+\.\d{2})", full_text)
+    if m:
+        opening_balance = clean_amount(m.group(1))
 
-    date_raw = str(date_raw).strip()
+    prev_balance = opening_balance
 
-    # DD/MM/YYYY
-    try:
-        return datetime.strptime(date_raw, "%d/%m/%Y").strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-
-    # DD/MM (missing year)
-    try:
-        return datetime.strptime(f"{date_raw}/{year}", "%d/%m/%Y").strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-
-    # Already ISO?
-    try:
-        return datetime.fromisoformat(date_raw).strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-
-    # Absolute fallback (never crash app)
-    return f"{year}-01-01"
-
-
-# ---------------------------------------------------------
-# MAIN PARSER
-# ---------------------------------------------------------
-
-def parse_bank_islam(pdf, source_filename=""):
-    """
-    Parse Bank Islam PDF statements.
-    Returns list of transaction dictionaries.
-    """
-
-    all_transactions = []
-    detected_year = None
-
-    # Extract year from first few pages
-    for page in pdf.pages[:3]:
-        text = page.extract_text() or ""
-        detected_year = extract_year_from_text(text)
-        if detected_year:
-            break
-
-    # Fallback to current year
-    if not detected_year:
-        detected_year = str(datetime.now().year)
-
-    # Process pages
-    for page_num, page in enumerate(pdf.pages, start=1):
+    for page_no, page in enumerate(pdf.pages, start=1):
         tables = page.extract_tables()
         if not tables:
             continue
 
         for table in tables:
-            if not table or len(table) < 2:
-                continue
-
-            # Skip header
-            for row in table[1:]:
-                if len(row) < 10:
+            for row in table:
+                if not row or len(row) < 5:
                     continue
 
-                (
-                    no,
-                    date_raw,
-                    eft_no,
-                    code,
-                    desc,
-                    ref_no,
-                    branch,
-                    debit_raw,
-                    credit_raw,
-                    balance_raw
-                ) = row[:10]
+                row_text = " ".join(str(c) for c in row if c)
 
-                # Skip totals / invalid rows
-                if not date_raw or "Total" in str(no):
+                date_match = re.search(r"\d{1,2}/\d{1,2}/\d{4}", row_text)
+                if not date_match:
                     continue
 
-                date_fmt = format_date(date_raw, detected_year)
+                amounts = re.findall(r"[\d,]+\.\d{2}", row_text)
+                if not amounts:
+                    continue
 
-                description = " ".join(str(desc).split()) if desc else ""
+                balance = clean_amount(amounts[-1])
+                if balance is None:
+                    continue
 
-                debit = clean_amount(debit_raw)
-                credit = clean_amount(credit_raw)
-                balance = clean_amount(balance_raw)
+                iso_date = parse_date(date_match.group())
+                if not iso_date:
+                    continue
 
-                all_transactions.append({
-                    "date": date_fmt,                  # ✅ ISO date
-                    "description": description,
+                desc = row_text.replace(date_match.group(), "")
+                desc = desc.replace(amounts[-1], "")
+                desc = " ".join(desc.split())
+
+                debit = credit = 0.0
+                if prev_balance is not None:
+                    delta = round(balance - prev_balance, 2)
+                    if delta > 0:
+                        credit = delta
+                    elif delta < 0:
+                        debit = abs(delta)
+
+                prev_balance = balance
+
+                rows.append({
+                    "date": iso_date,
+                    "description": desc,
                     "debit": debit,
                     "credit": credit,
                     "balance": balance,
-                    "page": page_num,
+                    "page": page_no,
+                    "bank": "Bank Islam",
                     "source_file": source_filename,
-                    "bank": "Bank Islam"
                 })
 
-    return all_transactions
+    return rows
+
+
+# ---------------------------------------------------------
+# PyMuPDF FALLBACK (simple version)
+# ---------------------------------------------------------
+
+def parse_with_pymupdf(pdf, source_filename):
+    results = []
+
+    pdf.stream.seek(0)
+    pdf_bytes = pdf.stream.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    prev_balance = None
+
+    for page_index in range(doc.page_count):
+        page = doc[page_index]
+        words = page.get_text("words")
+
+        rows = {}
+        for x0, y0, x1, y1, text, *_ in words:
+            y = round(y0, 1)
+            rows.setdefault(y, []).append((x0, text))
+
+        for y in sorted(rows):
+            row_text = " ".join(t[1] for t in sorted(rows[y], key=lambda x: x[0]))
+
+            date_match = re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", row_text)
+            if not date_match:
+                continue
+
+            amounts = re.findall(r"[\d,]+\.\d{2}", row_text)
+            if not amounts:
+                continue
+
+            balance = clean_amount(amounts[-1])
+            iso_date = parse_date(date_match.group())
+
+            if balance is None or not iso_date:
+                continue
+
+            desc = row_text.replace(date_match.group(), "")
+            desc = desc.replace(amounts[-1], "")
+            desc = " ".join(desc.split())
+
+            debit = credit = 0.0
+            if prev_balance is not None:
+                delta = round(balance - prev_balance, 2)
+                if delta > 0:
+                    credit = delta
+                elif delta < 0:
+                    debit = abs(delta)
+
+            prev_balance = balance
+
+            results.append({
+                "date": iso_date,
+                "description": desc,
+                "debit": debit,
+                "credit": credit,
+                "balance": balance,
+                "page": page_index + 1,
+                "bank": "Bank Islam",
+                "source_file": source_filename,
+            })
+
+    return results
+
+
+# ---------------------------------------------------------
+# MAIN ENTRY
+# ---------------------------------------------------------
+
+def parse_bank_islam(pdf, source_filename=""):
+    # 1️⃣ try v1-style table parsing
+    rows = parse_with_tables(pdf, source_filename)
+
+    # 2️⃣ fallback if table parsing fails
+    if not rows:
+        rows = parse_with_pymupdf(pdf, source_filename)
+
+    return rows
