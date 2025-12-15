@@ -1,104 +1,121 @@
-# maybank.py
-# Maybank parser – description ONLY from the same line as balance
-
-import re
+import regex as re
 
 # ============================================================
-# YEAR EXTRACTION
+# MTASB PATTERN (Maybank Variant)
+# Example: "01/05 TRANSFER TO A/C 320.00+ 43,906.52"
 # ============================================================
 
-def extract_year_from_text(text):
-    if not text:
-        return None
-
-    patterns = [
-        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
-        r'\d{1,2}/\d{1,2}/(\d{4})\s*-\s*\d{1,2}/\d{1,2}/\d{4}',
-        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})',
-    ]
-
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            y = m.groups()[-1]
-            return str(2000 + int(y)) if len(y) == 2 else y
-
-    return None
-
-
-# ============================================================
-# CLEAN LINE
-# ============================================================
-
-def clean_line(line):
-    if not line:
-        return ""
-    line = line.replace("\xa0", " ")
-    line = re.sub(r"\s+", " ", line)
-    return line.strip()
-
-
-# ============================================================
-# REGEX
-# Supports: .30 0.30 1,234.56
-# ============================================================
-
-AMOUNT = r"(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}"
-
-PATTERN_MAYBANK = re.compile(
-    rf"^(\d{{2}}/\d{{2}})\s+(.+?)\s+({AMOUNT})\s*([+-])\s+({AMOUNT})$"
+PATTERN_MAYBANK_MTASB = re.compile(
+    r"(\d{2}/\d{2})\s+"             # 01/05
+    r"(.+?)\s+"                     # description
+    r"([0-9,]+\.\d{2})([+-])\s+"    # amount + sign
+    r"([0-9,]+\.\d{2})"             # balance
 )
 
 
+def parse_line_maybank_mtasb(line, page_num, default_year="2025"):
+    m = PATTERN_MAYBANK_MTASB.search(line)
+    if not m:
+        return None
+
+    date_raw, desc, amount_raw, sign, balance_raw = m.groups()
+    day, month = date_raw.split("/")
+    year = default_year
+
+    amount = float(amount_raw.replace(",", ""))
+    balance = float(balance_raw.replace(",", ""))
+
+    credit = amount if sign == "+" else 0.0
+    debit  = amount if sign == "-" else 0.0
+
+    full_date = f"{year}-{month}-{day}"
+
+    return {
+        "date": full_date,
+        "description": desc.strip(),
+        "debit": debit,
+        "credit": credit,
+        "balance": balance,
+        "page": page_num,
+    }
+
+
 # ============================================================
-# MAIN PARSER
+# MBB PATTERN (Balance-Driven)
+# Example:
+# "01 Feb 2025 CMS - DR CORP CHG 78.00 - 50,405.76"
 # ============================================================
 
-def parse_transactions_maybank(pdf, source_file=""):
-    transactions = []
+PATTERN_MAYBANK_MBB = re.compile(
+    r"(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\s+"  # 01 Feb 2025
+    r"(.+?)\s+"                              # description
+    r"[0-9,]+\.\d{2}\s+[+-]\s+"              # ignore amount & sign
+    r"([0-9,]+\.\d{2})"                      # balance
+)
 
-    year = None
-    for p in pdf.pages:
-        year = extract_year_from_text(p.extract_text() or "")
-        if year:
-            break
-    if not year:
-        raise ValueError("Year not found")
+MONTH_MAP = {
+    "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+    "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
+    "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
+}
 
-    year = int(year)
 
-    for page_no, page in enumerate(pdf.pages, start=1):
-        lines = (page.extract_text() or "").splitlines()
+def parse_line_maybank_mbb(line, page_num, prev_balance):
+    m = PATTERN_MAYBANK_MBB.search(line)
+    if not m:
+        return None, prev_balance
 
-        for raw_line in lines:
-            line = clean_line(raw_line)
+    day, mon_abbr, year, desc, balance_raw = m.groups()
+    month = MONTH_MAP.get(mon_abbr.title(), "01")
+    balance = float(balance_raw.replace(",", ""))
 
-            # ✅ ONLY parse lines that contain balance
-            m = PATTERN_MAYBANK.match(line)
-            if not m:
-                continue
+    # First balance seen → cannot infer debit/credit yet
+    if prev_balance is None:
+        return None, balance
 
-            date_raw, desc, amt_raw, sign, bal_raw = m.groups()
-            day, month = date_raw.split("/")
+    diff = balance - prev_balance
 
-            def norm(x):
-                x = x.replace(",", "")
-                if x.startswith("."):
-                    x = "0" + x
-                return float(x)
+    credit = diff if diff > 0 else 0.0
+    debit  = abs(diff) if diff < 0 else 0.0
 
-            amount = norm(amt_raw)
-            balance = norm(bal_raw)
+    full_date = f"{year}-{month}-{day}"
 
-            transactions.append({
-                "date": f"{year}-{month}-{day}",
-                "description": desc.strip(),   # ✅ FIRST LINE ONLY
-                "debit": amount if sign == "-" else 0.0,
-                "credit": amount if sign == "+" else 0.0,
-                "balance": balance,
-                "page": page_no,
-                "bank": "Maybank",
-                "source_file": source_file,
-            })
+    tx = {
+        "date": full_date,
+        "description": desc.strip(),
+        "debit": debit,
+        "credit": credit,
+        "balance": balance,
+        "page": page_num,
+    }
 
-    return transactions
+    return tx, balance
+
+
+# ============================================================
+# MAIN ENTRY: PARSE ALL MAYBANK TRANSACTIONS
+# ============================================================
+
+def parse_transactions_maybank(text, page_num, default_year="2025"):
+    tx_list = []
+    prev_mbb_balance = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # --- MTASB ---
+        tx = parse_line_maybank_mtasb(line, page_num, default_year)
+        if tx:
+            tx_list.append(tx)
+            continue
+
+        # --- MBB (balance-based) ---
+        tx, prev_mbb_balance = parse_line_maybank_mbb(
+            line, page_num, prev_mbb_balance
+        )
+        if tx:
+            tx_list.append(tx)
+
+    return tx_list
