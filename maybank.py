@@ -79,21 +79,23 @@ def clean_maybank_line(line):
 
 
 # ============================================================
-# REGEX PATTERNS
+# REGEX PATTERNS (FIXED < RM1 ISSUE)
 # ============================================================
 
+AMOUNT_PATTERN = r"((?:\d{1,3}(?:,\d{3})*|\d*)\.\d{2})"
+
 PATTERN_MAYBANK_MTASB = re.compile(
-    r"(\d{2}/\d{2})\s+"
-    r"(.+?)\s+"
-    r"([0-9,]+\.\d{2})\s*([+-])\s*"
-    r"([0-9,]+\.\d{2})"
+    rf"(\d{{2}}/\d{{2}})\s+"
+    rf"(.+?)\s+"
+    rf"{AMOUNT_PATTERN}\s*([+-])\s*"
+    rf"{AMOUNT_PATTERN}"
 )
 
 PATTERN_MAYBANK_MBB = re.compile(
-    r"(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\s+"
-    r"(.+?)\s+"
-    r"([0-9,]+\.\d{2})\s*([+-])\s*"
-    r"([0-9,]+\.\d{2})"
+    rf"(\d{{2}})\s+([A-Za-z]{{3}})\s+(\d{{4}})\s+"
+    rf"(.+?)\s+"
+    rf"{AMOUNT_PATTERN}\s*([+-])\s*"
+    rf"{AMOUNT_PATTERN}"
 )
 
 MONTH_MAP = {
@@ -192,7 +194,7 @@ def parse_transactions_maybank(pdf, source_filename=""):
     all_transactions = []
     detected_year = None
 
-    # 🔍 Scan ALL pages for year (safe & cheap)
+    # 🔍 Scan ALL pages for year
     for page in pdf.pages:
         detected_year = extract_year_from_text(page.extract_text() or "")
         if detected_year:
