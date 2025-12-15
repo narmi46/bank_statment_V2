@@ -12,7 +12,7 @@ def parse_transactions_maybank(pdf, source_filename):
     """
     Parse Maybank/Maybank Islamic statement.
     Only extracts balance and first line of description.
-    Determines debit/credit based on balance changes from opening balance.
+    Determines debit/credit based on +/- indicators in transaction amount.
     
     Args:
         pdf: pdfplumber PDF object
@@ -24,7 +24,6 @@ def parse_transactions_maybank(pdf, source_filename):
     
     transactions = []
     opening_balance = None
-    previous_balance = None
     statement_year = None
     bank_name = "Maybank"
     
@@ -90,8 +89,6 @@ def parse_transactions_maybank(pdf, source_filename):
                                 break
                     
                     if opening_balance:
-                        previous_balance = opening_balance
-                        
                         # Add opening balance as first transaction
                         transactions.append({
                             'date': '',
@@ -117,7 +114,8 @@ def parse_transactions_maybank(pdf, source_filename):
                 'TARIKH NILAI', 'BUTIR URUSNIAGA', 'JUMLAH URUSNIAGA',
                 'BAKI PENYATA', 'PAGE', 'MUKA', 'ACCOUNT NUMBER', 
                 'NOMBOR AKAUN', 'PROTECTED BY PIDM', 'LEDGER BALANCE',
-                'ENDING BALANCE', 'TOTAL DEBIT', 'TOTAL CREDIT'
+                'ENDING BALANCE', 'TOTAL DEBIT', 'TOTAL CREDIT',
+                'PROFIT OUTSTANDING', 'FCN'
             ]
             
             if not line or any(skip in line.upper() for skip in skip_patterns):
@@ -125,28 +123,63 @@ def parse_transactions_maybank(pdf, source_filename):
                 continue
             
             # Match transaction pattern: DD/MM followed by content
-            # Format: DD/MM description amount balance
+            # Format: DD/MM description amount+/- balance
             match = re.match(r'^(\d{2}/\d{2})\s+(.+)', line)
             
             if match:
                 date_str = match.group(1)
                 rest_of_line = match.group(2).strip()
                 
-                # Extract all monetary values (format: 1,234.56 or 1234.56)
+                # Extract all monetary values with optional +/- signs
+                # Pattern: 1,234.56+ or 1,234.56- or just 1,234.56
                 numbers = re.findall(r'([\d,]+\.\d{2})([+-])?', rest_of_line)
                 
                 if len(numbers) >= 1:
-                    # Last number is always the statement balance
+                    # Last number is always the statement balance (no sign)
                     balance_str = numbers[-1][0].replace(',', '')
                     balance = float(balance_str)
                     
-                    # Transaction amount (if present, it's the second-to-last number)
-                    transaction_amount = 0.00
-                    has_explicit_amount = False
+                    # Initialize transaction amounts
+                    debit = 0.00
+                    credit = 0.00
                     
+                    # Check if there's a transaction amount (second-to-last number with +/- sign)
                     if len(numbers) >= 2:
-                        transaction_amount = float(numbers[-2][0].replace(',', ''))
-                        has_explicit_amount = True
+                        transaction_amount_str = numbers[-2][0].replace(',', '')
+                        transaction_amount = float(transaction_amount_str)
+                        sign = numbers[-2][1]  # Will be '+', '-', or None
+                        
+                        if sign == '+':
+                            # Explicit credit (money in)
+                            credit = transaction_amount
+                        elif sign == '-':
+                            # Explicit debit (money out)
+                            debit = transaction_amount
+                        else:
+                            # No sign - shouldn't happen in Maybank format, but handle it
+                            # Use description keywords as fallback
+                            desc_upper = rest_of_line.upper()
+                            
+                            credit_keywords = [
+                                'DEPOSIT', 'TRANSFER TO', 'TRANSFER INTO', 'CREDIT',
+                                'PAYMENT INTO', 'INTER-BANK PAYMENT INTO', 
+                                'CDM CASH DEPOSIT', 'CASH DEPOSIT', 'CR PYMT', 'CMS - CR'
+                            ]
+                            debit_keywords = [
+                                'TRANSFER FR', 'TRANSFER FROM', 'PAYMENT FR',
+                                'PAYMENT FROM', 'WITHDRAWAL', 'CHARGE', 'DEBIT',
+                                'PAYMENT DEBIT', 'CASH WITHDRAWAL', 'DR DIRECT DEBIT',
+                                'CMS - DR', 'ESI PAYMENT DEBIT', 'MAS PAYMENT',
+                                'FOREIGN TT DR', 'NOSTRO CHARGE', 'CABLE CHARGE'
+                            ]
+                            
+                            if any(kw in desc_upper for kw in credit_keywords):
+                                credit = transaction_amount
+                            elif any(kw in desc_upper for kw in debit_keywords):
+                                debit = transaction_amount
+                            else:
+                                # Default: treat as debit if unclear
+                                debit = transaction_amount
                     
                     # Extract description - everything before the first number
                     first_num_pos = rest_of_line.find(numbers[0][0])
@@ -161,17 +194,18 @@ def parse_transactions_maybank(pdf, source_filename):
                             # Take only the FIRST line of description
                             desc_candidate = next_line.split('\n')[0].strip()
                             
-                            # Make sure it's not just numbers
-                            if not re.match(r'^[\d,]+\.\d{2}', desc_candidate):
+                            # Make sure it's not just numbers or skip patterns
+                            if (not re.match(r'^[\d,]+\.\d{2}', desc_candidate) and 
+                                not any(skip in desc_candidate.upper() for skip in skip_patterns)):
                                 # Clean any trailing amounts
                                 desc_candidate = re.sub(r'\s*[\d,]+\.\d{2}[+-]?\s*$', '', desc_candidate)
                                 if desc_candidate and len(desc_candidate) > 2:
                                     description = desc_candidate
                                     i += 1  # Skip the description line we just consumed
                     
-                    # Clean description: remove any embedded amounts
+                    # Clean description: remove any embedded amounts and normalize whitespace
                     description = re.sub(r'[\d,]+\.\d{2}[+-]?', '', description)
-                    description = ' '.join(description.split())  # Normalize whitespace
+                    description = ' '.join(description.split())
                     
                     # Take only first line if somehow multi-line got through
                     if '\n' in description:
@@ -179,51 +213,6 @@ def parse_transactions_maybank(pdf, source_filename):
                     
                     # Limit description length
                     description = description[:100].strip() if description else 'TRANSACTION'
-                    
-                    # Determine debit or credit based on BALANCE CHANGE
-                    debit = 0.00
-                    credit = 0.00
-                    
-                    if previous_balance is not None:
-                        balance_change = balance - previous_balance
-                        
-                        if balance_change > 0:
-                            # Balance increased = Credit (money coming in)
-                            credit = transaction_amount if has_explicit_amount else abs(balance_change)
-                        elif balance_change < 0:
-                            # Balance decreased = Debit (money going out)
-                            debit = transaction_amount if has_explicit_amount else abs(balance_change)
-                        # If balance_change == 0, both remain 0.00 (no transaction amount)
-                    else:
-                        # Fallback if previous_balance is somehow None
-                        if has_explicit_amount:
-                            # Check for explicit +/- indicators
-                            if len(numbers) >= 2 and numbers[-2][1] == '+':
-                                credit = transaction_amount
-                            elif len(numbers) >= 2 and numbers[-2][1] == '-':
-                                debit = transaction_amount
-                            else:
-                                # Use description keywords to determine type
-                                desc_upper = description.upper()
-                                
-                                credit_keywords = [
-                                    'DEPOSIT', 'TRANSFER TO', 'TRANSFER INTO', 'CREDIT',
-                                    'PAYMENT INTO', 'INTER-BANK PAYMENT INTO', 
-                                    'CDM CASH DEPOSIT', 'CASH DEPOSIT', 'CR PYMT'
-                                ]
-                                debit_keywords = [
-                                    'TRANSFER FR', 'TRANSFER FROM', 'PAYMENT FR',
-                                    'PAYMENT FROM', 'WITHDRAWAL', 'CHARGE', 'DEBIT',
-                                    'PAYMENT DEBIT', 'CASH WITHDRAWAL', 'DR DIRECT DEBIT'
-                                ]
-                                
-                                if any(kw in desc_upper for kw in credit_keywords):
-                                    credit = transaction_amount
-                                elif any(kw in desc_upper for kw in debit_keywords):
-                                    debit = transaction_amount
-                                else:
-                                    # Default assumption: if amount exists, treat as debit
-                                    debit = transaction_amount
                     
                     # Convert date to full format (YYYY-MM-DD)
                     try:
@@ -249,9 +238,6 @@ def parse_transactions_maybank(pdf, source_filename):
                         'bank': bank_name,
                         'source_file': source_filename
                     })
-                    
-                    # Update previous balance for next iteration
-                    previous_balance = balance
             
             i += 1
     
