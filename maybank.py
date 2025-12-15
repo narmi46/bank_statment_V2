@@ -1,5 +1,5 @@
 # maybank.py
-# Compatible with existing app.py (NO app changes needed)
+# Maybank parser – description ONLY from the same line as balance
 
 import re
 
@@ -15,7 +15,6 @@ def extract_year_from_text(text):
         r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
         r'\d{1,2}/\d{1,2}/(\d{4})\s*-\s*\d{1,2}/\d{1,2}/\d{4}',
         r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})',
-        r'(JANUARI|FEBRUARI|MAC|APRIL|MEI|JUN|JULAI|OGOS|SEPTEMBER|OKTOBER|NOVEMBER|DISEMBER)\s+(\d{4})',
     ]
 
     for p in patterns:
@@ -28,143 +27,78 @@ def extract_year_from_text(text):
 
 
 # ============================================================
-# CLEANER
+# CLEAN LINE
 # ============================================================
 
 def clean_line(line):
     if not line:
         return ""
-    for ch in ["\u200b", "\u200e", "\u200f", "\ufeff", "\xa0"]:
-        line = line.replace(ch, " ")
-    return re.sub(r"\s+", " ", line).strip()
+    line = line.replace("\xa0", " ")
+    line = re.sub(r"\s+", " ", line)
+    return line.strip()
 
 
 # ============================================================
-# REGEX (FIXED: SUPPORTS < RM1)
+# REGEX
+# Supports: .30 0.30 1,234.56
 # ============================================================
 
-AMOUNT = r"((?:\d{1,3}(?:,\d{3})*|\d*)\.\d{2})"
+AMOUNT = r"(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}"
 
-PATTERN_MTASB = re.compile(
-    rf"(\d{{2}}/\d{{2}})\s+(.+?)\s+{AMOUNT}\s*([+-])\s*{AMOUNT}"
+PATTERN_MAYBANK = re.compile(
+    rf"^(\d{{2}}/\d{{2}})\s+(.+?)\s+({AMOUNT})\s*([+-])\s+({AMOUNT})$"
 )
 
-PATTERN_MBB = re.compile(
-    rf"(\d{{2}})\s+([A-Za-z]{{3}})\s+(\d{{4}})\s+(.+?)\s+{AMOUNT}\s*([+-])\s*{AMOUNT}"
-)
-
-MONTH_MAP = {
-    "Jan":"01","Feb":"02","Mar":"03","Apr":"04","May":"05","Jun":"06",
-    "Jul":"07","Aug":"08","Sep":"09","Oct":"10","Nov":"11","Dec":"12",
-}
-
 
 # ============================================================
-# BROKEN LINE RECONSTRUCTION
-# ============================================================
-
-def reconstruct_lines(lines):
-    out, buf = [], ""
-    for line in lines:
-        line = clean_line(line)
-        if not line:
-            continue
-        if re.match(r"^\d{2}/\d{2}", line) or re.match(r"^\d{2}\s+[A-Za-z]{3}\s+\d{4}", line):
-            if buf:
-                out.append(buf)
-            buf = line
-        else:
-            buf += " " + line
-    if buf:
-        out.append(buf)
-    return out
-
-
-# ============================================================
-# LINE PARSERS
-# ============================================================
-
-def parse_mtasb(line, page, year):
-    m = PATTERN_MTASB.search(line)
-    if not m:
-        return None
-
-    date_raw, desc, amt, sign, bal = m.groups()
-    d, mth = date_raw.split("/")
-
-    amount = float(amt.replace(",", ""))
-    balance = float(bal.replace(",", ""))
-
-    return {
-        "date": f"{year}-{mth}-{d}",
-        "description": desc.strip(),
-        "debit": amount if sign == "-" else 0.0,
-        "credit": amount if sign == "+" else 0.0,
-        "balance": balance,
-        "page": page,
-        "month": int(mth),
-    }
-
-
-def parse_mbb(line, page):
-    m = PATTERN_MBB.search(line)
-    if not m:
-        return None
-
-    d, mon, y, desc, amt, sign, bal = m.groups()
-    mth = MONTH_MAP.get(mon.title())
-    if not mth:
-        return None
-
-    amount = float(amt.replace(",", ""))
-    balance = float(bal.replace(",", ""))
-
-    return {
-        "date": f"{y}-{mth}-{d}",
-        "description": desc.strip(),
-        "debit": amount if sign == "-" else 0.0,
-        "credit": amount if sign == "+" else 0.0,
-        "balance": balance,
-        "page": page,
-    }
-
-
-# ============================================================
-# MAIN ENTRY (USED BY app.py)
+# MAIN PARSER
 # ============================================================
 
 def parse_transactions_maybank(pdf, source_file=""):
     transactions = []
-    year = None
 
+    year = None
     for p in pdf.pages:
         year = extract_year_from_text(p.extract_text() or "")
         if year:
             break
-
     if not year:
-        raise ValueError("Year not detected")
+        raise ValueError("Year not found")
 
     year = int(year)
-    last_month = None
 
-    for page_num, page in enumerate(pdf.pages, start=1):
-        lines = reconstruct_lines((page.extract_text() or "").splitlines())
+    for page_no, page in enumerate(pdf.pages, start=1):
+        lines = (page.extract_text() or "").splitlines()
 
-        for line in lines:
-            tx = parse_mtasb(line, page_num, year)
-            if tx:
-                if last_month and tx["month"] < last_month:
-                    year += 1
-                last_month = tx["month"]
-                tx["date"] = f"{year}-{tx['date'][5:]}"
-                tx.pop("month")
-            else:
-                tx = parse_mbb(line, page_num)
+        for raw_line in lines:
+            line = clean_line(raw_line)
 
-            if tx:
-                tx["bank"] = "Maybank"
-                tx["source_file"] = source_file
-                transactions.append(tx)
+            # ✅ ONLY parse lines that contain balance
+            m = PATTERN_MAYBANK.match(line)
+            if not m:
+                continue
+
+            date_raw, desc, amt_raw, sign, bal_raw = m.groups()
+            day, month = date_raw.split("/")
+
+            def norm(x):
+                x = x.replace(",", "")
+                if x.startswith("."):
+                    x = "0" + x
+                return float(x)
+
+            amount = norm(amt_raw)
+            balance = norm(bal_raw)
+
+            transactions.append({
+                "date": f"{year}-{month}-{day}",
+                "description": desc.strip(),   # ✅ FIRST LINE ONLY
+                "debit": amount if sign == "-" else 0.0,
+                "credit": amount if sign == "+" else 0.0,
+                "balance": balance,
+                "page": page_no,
+                "bank": "Maybank",
+                "source_file": source_file,
+            })
 
     return transactions
