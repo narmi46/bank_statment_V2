@@ -2,7 +2,7 @@ import fitz  # PyMuPDF
 import re
 from datetime import datetime
 
-def parse_transactions_maybank_pymupdf(pdf_path, source_filename):
+def parse_transactions_maybank(pdf_path, source_filename):
     """
     Parse Maybank / Maybank Islamic statements using PyMuPDF.
     Bank-accurate version:
