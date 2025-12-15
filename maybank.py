@@ -6,30 +6,29 @@ import os
 def parse_transactions_maybank(pdf_input, source_filename):
     """
     PyMuPDF-only extraction.
-    pdf_input can be:
+    Handles:
+    - filename only
+    - full file path
     - pdfplumber PDF object
-    - file path string
     """
 
-    # ------------------------------
-    # Resolve PDF PATH (critical fix)
-    # ------------------------------
+    # ---------------------------------
+    # OPEN PDF SAFELY (CRITICAL FIX)
+    # ---------------------------------
     if isinstance(pdf_input, str):
-        pdf_path = pdf_input
-    else:
-        # pdfplumber object → extract real path
-        if hasattr(pdf_input, "stream") and hasattr(pdf_input.stream, "name"):
-            pdf_path = pdf_input.stream.name
+        # Case 1: string path or filename
+        if os.path.exists(pdf_input):
+            doc = fitz.open(pdf_input)
         else:
-            raise ValueError("Cannot resolve PDF file path for PyMuPDF")
+            raise FileNotFoundError(f"PDF not found on disk: {pdf_input}")
 
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-    # ------------------------------
-    # Open with PyMuPDF ONLY
-    # ------------------------------
-    doc = fitz.open(pdf_path)
+    else:
+        # Case 2: pdfplumber object → read bytes
+        if hasattr(pdf_input, "stream"):
+            pdf_bytes = pdf_input.stream.read()
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        else:
+            raise ValueError("Unsupported PDF input type")
 
     transactions = []
     seen_signatures = set()
@@ -39,13 +38,13 @@ def parse_transactions_maybank(pdf_input, source_filename):
     statement_year = None
     bank_name = "Maybank"
 
-    # ------------------------------
-    # Iterate pages
-    # ------------------------------
+    # ---------------------------------
+    # PARSE PAGES
+    # ---------------------------------
     for page_index in range(len(doc)):
         page = doc[page_index]
 
-        # ---- LAYOUT-SAFE EXTRACTION ----
+        # Layout-safe extraction
         blocks = page.get_text("blocks")
         blocks = sorted(blocks, key=lambda b: (round(b[1]), round(b[0])))
 
@@ -58,11 +57,9 @@ def parse_transactions_maybank(pdf_input, source_filename):
         lines = [l.strip() for l in lines if l.strip()]
         page_num = page_index + 1
 
-        # ------------------------------
-        # HEADER
-        # ------------------------------
+        # -------- HEADER --------
         if page_num == 1:
-            for line in lines[:25]:
+            for line in lines[:30]:
                 up = line.upper()
                 if "MAYBANK ISLAMIC" in up:
                     bank_name = "Maybank Islamic"
@@ -76,9 +73,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
         if not statement_year:
             statement_year = "2025"
 
-        # ------------------------------
-        # OPENING BALANCE
-        # ------------------------------
+        # -------- OPENING BALANCE --------
         if page_num == 1 and opening_balance is None:
             for line in lines:
                 if any(k in line.upper() for k in [
@@ -102,9 +97,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
                         })
                     break
 
-        # ------------------------------
-        # TRANSACTIONS
-        # ------------------------------
+        # -------- TRANSACTIONS --------
         i = 0
         while i < len(lines):
             line = lines[i]
@@ -132,7 +125,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
             description = " ".join(description.split())[:120]
 
-            # date normalize
+            # normalize date
             try:
                 dt = datetime.strptime(f"{date_str}/{statement_year}", "%d/%m/%Y")
                 formatted_date = dt.strftime("%Y-%m-%d")
@@ -144,7 +137,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
                 i += 1
                 continue
 
-            # debit / credit by balance delta
+            # debit / credit via balance delta
             debit = credit = 0.00
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
