@@ -1,121 +1,158 @@
-import regex as re
+import re
+from datetime import datetime
 
-# ============================================================
-# MTASB PATTERN (Maybank Variant)
-# Example: "01/05 TRANSFER TO A/C 320.00+ 43,906.52"
-# ============================================================
+# -----------------------------
+# Regex
+# -----------------------------
+DATE_ISLAMIC = re.compile(r"^\d{2}\s[A-Za-z]{3}\s\d{4}")
+DATE_CURRENT = re.compile(r"^\d{2}/\d{2}")
 
-PATTERN_MAYBANK_MTASB = re.compile(
-    r"(\d{2}/\d{2})\s+"             # 01/05
-    r"(.+?)\s+"                     # description
-    r"([0-9,]+\.\d{2})([+-])\s+"    # amount + sign
-    r"([0-9,]+\.\d{2})"             # balance
-)
+OPENING_BAL = re.compile(r"BEGINNING BALANCE\s*:?\s*([\d,]+\.\d{2})")
+STATEMENT_DATE = re.compile(r"STATEMENT DATE\s*:?\s*(\d{2}/\d{2}/\d{2,4})")
 
-
-def parse_line_maybank_mtasb(line, page_num, default_year="2025"):
-    m = PATTERN_MAYBANK_MTASB.search(line)
-    if not m:
-        return None
-
-    date_raw, desc, amount_raw, sign, balance_raw = m.groups()
-    day, month = date_raw.split("/")
-    year = default_year
-
-    amount = float(amount_raw.replace(",", ""))
-    balance = float(balance_raw.replace(",", ""))
-
-    credit = amount if sign == "+" else 0.0
-    debit  = amount if sign == "-" else 0.0
-
-    full_date = f"{year}-{month}-{day}"
-
-    return {
-        "date": full_date,
-        "description": desc.strip(),
-        "debit": debit,
-        "credit": credit,
-        "balance": balance,
-        "page": page_num,
-    }
+AMOUNT_SIGNED = re.compile(r"([\d,]+\.\d{2})([+-])$")
+AMOUNT_ISLAMIC = re.compile(r"([\d,]+\.\d{2})\s*([+-])\s*([\d,]+\.\d{2})$")
 
 
-# ============================================================
-# MBB PATTERN (Balance-Driven)
-# Example:
-# "01 Feb 2025 CMS - DR CORP CHG 78.00 - 50,405.76"
-# ============================================================
+# -----------------------------
+# Main parser
+# -----------------------------
+def parse_transactions_maybank(pdf, source_file):
+    transactions = []
+    lines = []
 
-PATTERN_MAYBANK_MBB = re.compile(
-    r"(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\s+"  # 01 Feb 2025
-    r"(.+?)\s+"                              # description
-    r"[0-9,]+\.\d{2}\s+[+-]\s+"              # ignore amount & sign
-    r"([0-9,]+\.\d{2})"                      # balance
-)
+    opening_balance = None
+    previous_balance = None
+    statement_year = None
+    first_tx = True
 
-MONTH_MAP = {
-    "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
-    "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
-    "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
-}
+    # -----------------------------
+    # Extract all lines
+    # -----------------------------
+    for page_no, page in enumerate(pdf.pages, start=1):
+        text = page.extract_text()
+        if not text:
+            continue
+        for l in text.splitlines():
+            lines.append((l.strip(), page_no))
 
+    # -----------------------------
+    # Find statement year (for current acct)
+    # -----------------------------
+    for line, _ in lines:
+        m = STATEMENT_DATE.search(line)
+        if m:
+            dt = datetime.strptime(m.group(1), "%d/%m/%y" if len(m.group(1)) == 8 else "%d/%m/%Y")
+            statement_year = dt.year
+            break
 
-def parse_line_maybank_mbb(line, page_num, prev_balance):
-    m = PATTERN_MAYBANK_MBB.search(line)
-    if not m:
-        return None, prev_balance
+    # -----------------------------
+    # Find opening balance FIRST
+    # -----------------------------
+    for line, _ in lines:
+        m = OPENING_BAL.search(line)
+        if m:
+            opening_balance = float(m.group(1).replace(",", ""))
+            previous_balance = opening_balance
+            break
 
-    day, mon_abbr, year, desc, balance_raw = m.groups()
-    month = MONTH_MAP.get(mon_abbr.title(), "01")
-    balance = float(balance_raw.replace(",", ""))
+    if opening_balance is None:
+        raise ValueError("Opening balance not found")
 
-    # First balance seen → cannot infer debit/credit yet
-    if prev_balance is None:
-        return None, balance
+    current_tx = None
 
-    diff = balance - prev_balance
+    # -----------------------------
+    # Parse transactions
+    # -----------------------------
+    for line, page_no in lines:
 
-    credit = diff if diff > 0 else 0.0
-    debit  = abs(diff) if diff < 0 else 0.0
+        is_islamic = DATE_ISLAMIC.match(line)
+        is_current = DATE_CURRENT.match(line)
 
-    full_date = f"{year}-{month}-{day}"
-
-    tx = {
-        "date": full_date,
-        "description": desc.strip(),
-        "debit": debit,
-        "credit": credit,
-        "balance": balance,
-        "page": page_num,
-    }
-
-    return tx, balance
-
-
-# ============================================================
-# MAIN ENTRY: PARSE ALL MAYBANK TRANSACTIONS
-# ============================================================
-
-def parse_transactions_maybank(text, page_num, default_year="2025"):
-    tx_list = []
-    prev_mbb_balance = None
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
+        if not (is_islamic or is_current):
             continue
 
-        # --- MTASB ---
-        tx = parse_line_maybank_mtasb(line, page_num, default_year)
-        if tx:
-            tx_list.append(tx)
-            continue
+        # Save previous
+        if current_tx:
+            transactions.append(current_tx)
 
-        # --- MBB (balance-based) ---
-        tx, prev_mbb_balance = parse_line_maybank_mbb(
-            line, page_num, prev_mbb_balance
-        )
-        if tx:
-            tx_list.append(tx)
+        # -----------------------------
+        # DATE
+        # -----------------------------
+        if is_islamic:
+            date_str = " ".join(line.split()[:3])
+            tx_date = datetime.strptime(date_str, "%d %b %Y").strftime("%Y-%m-%d")
+            rest = line.replace(date_str, "").strip()
 
-    return tx_list
+        else:
+            date_part = line[:5]  # DD/MM
+            if not statement_year:
+                raise ValueError("Statement year not found for DD/MM format")
+            tx_date = datetime.strptime(
+                f"{date_part}/{statement_year}", "%d/%m/%Y"
+            ).strftime("%Y-%m-%d")
+            rest = line[5:].strip()
+
+        # -----------------------------
+        # Amount & balance
+        # -----------------------------
+        debit = credit = 0.0
+        balance = None
+
+        m_islamic = AMOUNT_ISLAMIC.search(line)
+        m_signed = AMOUNT_SIGNED.search(line)
+
+        if m_islamic:
+            amount = float(m_islamic.group(1).replace(",", ""))
+            sign = m_islamic.group(2)
+            balance = float(m_islamic.group(3).replace(",", ""))
+
+        elif m_signed:
+            amount = float(m_signed.group(1).replace(",", ""))
+            sign = m_signed.group(2)
+            balance_match = re.search(r"([\d,]+\.\d{2})$", line)
+            balance = float(balance_match.group(1).replace(",", "")) if balance_match else None
+        else:
+            amount = None
+            sign = None
+
+        # -----------------------------
+        # Description (FIRST LINE ONLY)
+        # -----------------------------
+        desc = rest
+        if amount:
+            desc = desc.replace(m_signed.group(0), "").strip() if m_signed else desc
+        description = desc
+
+        # -----------------------------
+        # Debit / Credit logic
+        # -----------------------------
+        if first_tx and balance is not None:
+            if balance < previous_balance:
+                debit = round(previous_balance - balance, 2)
+            else:
+                credit = round(balance - previous_balance, 2)
+            first_tx = False
+        else:
+            if sign == "-":
+                debit = amount
+            elif sign == "+":
+                credit = amount
+
+        current_tx = {
+            "date": tx_date,
+            "description": description,
+            "debit": debit,
+            "credit": credit,
+            "balance": balance,
+            "page": page_no,
+            "bank": "Maybank",
+            "source_file": source_file
+        }
+
+        previous_balance = balance
+
+    if current_tx:
+        transactions.append(current_tx)
+
+    return transactions
