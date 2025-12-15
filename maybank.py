@@ -1,13 +1,35 @@
 import re
-from datetime import datetime
 import fitz  # PyMuPDF
+from datetime import datetime
+import os
 
 def parse_transactions_maybank(pdf_input, source_filename):
     """
-    Accepts:
-    - pdfplumber PDF object (backward compatible)
-    - file path string (PyMuPDF)
+    PyMuPDF-only extraction.
+    pdf_input can be:
+    - pdfplumber PDF object
+    - file path string
     """
+
+    # ------------------------------
+    # Resolve PDF PATH (critical fix)
+    # ------------------------------
+    if isinstance(pdf_input, str):
+        pdf_path = pdf_input
+    else:
+        # pdfplumber object → extract real path
+        if hasattr(pdf_input, "stream") and hasattr(pdf_input.stream, "name"):
+            pdf_path = pdf_input.stream.name
+        else:
+            raise ValueError("Cannot resolve PDF file path for PyMuPDF")
+
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    # ------------------------------
+    # Open with PyMuPDF ONLY
+    # ------------------------------
+    doc = fitz.open(pdf_path)
 
     transactions = []
     seen_signatures = set()
@@ -18,34 +40,33 @@ def parse_transactions_maybank(pdf_input, source_filename):
     bank_name = "Maybank"
 
     # ------------------------------
-    # Detect input type
+    # Iterate pages
     # ------------------------------
-    if isinstance(pdf_input, str):
-        # PyMuPDF path
-        doc = fitz.open(pdf_input)
-        pages = [(i + 1, doc[i].get_text("text")) for i in range(len(doc))]
-        close_doc = True
-    else:
-        # Assume pdfplumber PDF object
-        pages = [(i + 1, p.extract_text()) for i, p in enumerate(pdf_input.pages)]
-        close_doc = False
+    for page_index in range(len(doc)):
+        page = doc[page_index]
 
-    # ------------------------------
-    # Parse pages
-    # ------------------------------
-    for page_num, text in pages:
-        if not text:
-            continue
+        # ---- LAYOUT-SAFE EXTRACTION ----
+        blocks = page.get_text("blocks")
+        blocks = sorted(blocks, key=lambda b: (round(b[1]), round(b[0])))
 
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        lines = []
+        for b in blocks:
+            text = b[4].strip()
+            if text:
+                lines.extend(text.split('\n'))
 
-        # ---- HEADER ----
+        lines = [l.strip() for l in lines if l.strip()]
+        page_num = page_index + 1
+
+        # ------------------------------
+        # HEADER
+        # ------------------------------
         if page_num == 1:
-            for line in lines[:20]:
+            for line in lines[:25]:
                 up = line.upper()
-                if 'MAYBANK ISLAMIC' in up:
+                if "MAYBANK ISLAMIC" in up:
                     bank_name = "Maybank Islamic"
-                elif 'MAYBANK' in up:
+                elif "MAYBANK" in up:
                     bank_name = "Maybank"
 
                 year_match = re.search(r'20\d{2}', line)
@@ -55,36 +76,40 @@ def parse_transactions_maybank(pdf_input, source_filename):
         if not statement_year:
             statement_year = "2025"
 
-        # ---- OPENING BALANCE ----
+        # ------------------------------
+        # OPENING BALANCE
+        # ------------------------------
         if page_num == 1 and opening_balance is None:
             for line in lines:
                 if any(k in line.upper() for k in [
-                    'OPENING BALANCE',
-                    'BEGINNING BALANCE',
-                    'BAKI PERMULAAN'
+                    "OPENING BALANCE",
+                    "BEGINNING BALANCE",
+                    "BAKI PERMULAAN"
                 ]):
                     bal = re.search(r'([\d,]+\.\d{2})', line)
                     if bal:
                         opening_balance = float(bal.group(1).replace(',', ''))
                         previous_balance = opening_balance
                         transactions.append({
-                            'date': '',
-                            'description': 'BEGINNING BALANCE',
-                            'debit': 0.00,
-                            'credit': 0.00,
-                            'balance': round(opening_balance, 2),
-                            'page': page_num,
-                            'bank': bank_name,
-                            'source_file': source_filename
+                            "date": "",
+                            "description": "BEGINNING BALANCE",
+                            "debit": 0.00,
+                            "credit": 0.00,
+                            "balance": round(opening_balance, 2),
+                            "page": page_num,
+                            "bank": bank_name,
+                            "source_file": source_filename
                         })
                     break
 
-        # ---- TRANSACTIONS ----
+        # ------------------------------
+        # TRANSACTIONS
+        # ------------------------------
         i = 0
         while i < len(lines):
             line = lines[i]
 
-            match = re.match(r'^(\d{2}/\d{2})\s+(.+)', line)
+            match = re.match(r'^(\d{2}/\d{2})\s+(.*)', line)
             if not match:
                 i += 1
                 continue
@@ -96,31 +121,30 @@ def parse_transactions_maybank(pdf_input, source_filename):
                 continue
 
             balance = float(numbers[-1].replace(',', ''))
-
             description = rest[:rest.find(numbers[0])].strip()
 
-            # Multiline description
+            # multiline description
             if i + 1 < len(lines):
-                next_line = lines[i + 1]
-                if not re.match(r'^\d{2}/\d{2}', next_line):
-                    description += ' ' + next_line
+                nxt = lines[i + 1]
+                if not re.match(r'^\d{2}/\d{2}', nxt):
+                    description += " " + nxt
                     i += 1
 
-            description = ' '.join(description.split())[:100]
+            description = " ".join(description.split())[:120]
 
-            # Date
+            # date normalize
             try:
                 dt = datetime.strptime(f"{date_str}/{statement_year}", "%d/%m/%Y")
                 formatted_date = dt.strftime("%Y-%m-%d")
             except:
                 formatted_date = date_str
 
-            # Safe REV filter
-            if description.upper().startswith('REV ') or description.upper() == 'REV':
+            # skip pure reversals
+            if description.upper().startswith("REV "):
                 i += 1
                 continue
 
-            # Debit / Credit by balance delta
+            # debit / credit by balance delta
             debit = credit = 0.00
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
@@ -131,23 +155,21 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
             previous_balance = balance
 
-            txn_signature = (formatted_date, debit, credit, balance)
-            if txn_signature not in seen_signatures:
-                seen_signatures.add(txn_signature)
+            sig = (formatted_date, debit, credit, balance)
+            if sig not in seen_signatures:
+                seen_signatures.add(sig)
                 transactions.append({
-                    'date': formatted_date,
-                    'description': description,
-                    'debit': debit,
-                    'credit': credit,
-                    'balance': round(balance, 2),
-                    'page': page_num,
-                    'bank': bank_name,
-                    'source_file': source_filename
+                    "date": formatted_date,
+                    "description": description,
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": round(balance, 2),
+                    "page": page_num,
+                    "bank": bank_name,
+                    "source_file": source_filename
                 })
 
             i += 1
 
-    if close_doc:
-        doc.close()
-
+    doc.close()
     return transactions
