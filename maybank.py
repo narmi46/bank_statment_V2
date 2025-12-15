@@ -1,7 +1,15 @@
+import fitz  # PyMuPDF
 import re
 from datetime import datetime
 
-def parse_transactions_maybank(pdf, source_filename):
+def parse_transactions_maybank_pymupdf(pdf_path, source_filename):
+    """
+    Parse Maybank / Maybank Islamic statements using PyMuPDF.
+    Bank-accurate version:
+    - Balance delta inference
+    - Safe REV filtering
+    - Strict deduplication
+    """
 
     transactions = []
     seen_signatures = set()
@@ -11,19 +19,23 @@ def parse_transactions_maybank(pdf, source_filename):
     statement_year = None
     bank_name = "Maybank"
 
-    for page_num, page in enumerate(pdf.pages, start=1):
-        text = page.extract_text()
+    doc = fitz.open(pdf_path)
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        text = page.get_text("text")
         if not text:
             continue
 
-        lines = text.split('\n')
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
 
         # ---- HEADER ----
-        if page_num == 1:
-            for line in lines[:15]:
-                if 'MAYBANK ISLAMIC' in line.upper():
+        if page_num == 0:
+            for line in lines[:20]:
+                up = line.upper()
+                if 'MAYBANK ISLAMIC' in up:
                     bank_name = "Maybank Islamic"
-                elif 'MAYBANK' in line.upper():
+                elif 'MAYBANK' in up:
                     bank_name = "Maybank"
 
                 year_match = re.search(r'20\d{2}', line)
@@ -34,9 +46,13 @@ def parse_transactions_maybank(pdf, source_filename):
             statement_year = "2025"
 
         # ---- OPENING BALANCE ----
-        if page_num == 1 and opening_balance is None:
+        if page_num == 0 and opening_balance is None:
             for line in lines:
-                if any(k in line.upper() for k in ['OPENING BALANCE', 'BEGINNING BALANCE', 'BAKI PERMULAAN']):
+                if any(k in line.upper() for k in [
+                    'OPENING BALANCE',
+                    'BEGINNING BALANCE',
+                    'BAKI PERMULAAN'
+                ]):
                     bal = re.search(r'([\d,]+\.\d{2})', line)
                     if bal:
                         opening_balance = float(bal.group(1).replace(',', ''))
@@ -47,7 +63,7 @@ def parse_transactions_maybank(pdf, source_filename):
                             'debit': 0.00,
                             'credit': 0.00,
                             'balance': round(opening_balance, 2),
-                            'page': page_num,
+                            'page': page_num + 1,
                             'bank': bank_name,
                             'source_file': source_filename
                         })
@@ -56,11 +72,7 @@ def parse_transactions_maybank(pdf, source_filename):
         # ---- TRANSACTIONS ----
         i = 0
         while i < len(lines):
-            line = lines[i].strip()
-
-            if not line:
-                i += 1
-                continue
+            line = lines[i]
 
             match = re.match(r'^(\d{2}/\d{2})\s+(.+)', line)
             if not match:
@@ -76,31 +88,31 @@ def parse_transactions_maybank(pdf, source_filename):
 
             balance = float(numbers[-1].replace(',', ''))
 
-            # Description
+            # ---- DESCRIPTION ----
             description = rest[:rest.find(numbers[0])].strip()
 
-            # Multiline description support
+            # Multiline description
             if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if next_line and not re.match(r'^\d{2}/\d{2}', next_line):
+                next_line = lines[i + 1]
+                if not re.match(r'^\d{2}/\d{2}', next_line):
                     description += ' ' + next_line
                     i += 1
 
             description = ' '.join(description.split())[:100]
 
-            # ---- DATE FORMAT ----
+            # ---- DATE ----
             try:
-                date_obj = datetime.strptime(f"{date_str}/{statement_year}", "%d/%m/%Y")
-                formatted_date = date_obj.strftime("%Y-%m-%d")
+                dt = datetime.strptime(f"{date_str}/{statement_year}", "%d/%m/%Y")
+                formatted_date = dt.strftime("%Y-%m-%d")
             except:
                 formatted_date = date_str
 
-            # ---- REV FILTER (SAFE) ----
+            # ---- SAFE REV FILTER ----
             if description.upper().startswith('REV ') or description.upper() == 'REV':
                 i += 1
                 continue
 
-            # ---- DEBIT / CREDIT INFERENCE (BANK-ACCURATE) ----
+            # ---- BANK-ACCURATE DEBIT / CREDIT ----
             debit = credit = 0.00
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
@@ -120,11 +132,12 @@ def parse_transactions_maybank(pdf, source_filename):
                     'debit': debit,
                     'credit': credit,
                     'balance': round(balance, 2),
-                    'page': page_num,
+                    'page': page_num + 1,
                     'bank': bank_name,
                     'source_file': source_filename
                 })
 
             i += 1
 
+    doc.close()
     return transactions
