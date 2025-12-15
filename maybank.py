@@ -1,309 +1,222 @@
+"""
+Maybank Islamic Bank Statement Parser
+Extracts: Balance and First Line Description Only
+Compatible with existing app.py structure
+"""
+
 import re
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
 
-# -----------------------------
-# Helpers
-# -----------------------------
 
-MONTHS = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
-}
-
-def _to_float_money(s: str) -> Optional[float]:
+def parse_transactions_maybank_islamic(pdf, source_filename):
     """
-    Convert '50,483.76' or '.50' or '0.50' to float.
-    Returns None if not parseable.
+    Parse Maybank Islamic statement.
+    Only extracts balance and first line of description.
+    Determines debit/credit based on balance changes from opening balance.
+    
+    Args:
+        pdf: pdfplumber PDF object
+        source_filename: Name of the source PDF file
+        
+    Returns:
+        List of transaction dictionaries
     """
-    if s is None:
-        return None
-    s = s.strip()
-    if not s:
-        return None
-
-    # remove commas and spaces
-    s = s.replace(",", "").replace(" ", "")
-
-    # handle values like ".50"
-    if s.startswith("."):
-        s = "0" + s
-
-    # keep only digits and dot (we do sign separately)
-    if not re.fullmatch(r"\d+(\.\d+)?", s):
-        return None
-
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _extract_statement_year(all_text: str) -> Optional[int]:
-    """
-    Find statement year from statement date lines like:
-      - '结单日期 : 31/01/25'
-      - '结单日期 :28/02/2025'
-      - 'STATEMENT DATE : 31/01/25'
-    """
-    # Prefer explicit "STATEMENT DATE" / Chinese "结单日期" vicinity, but fallback to any date with year.
-    patterns = [
-        r"(?:STATEMENT\s*DATE|结单日期)\s*:?\s*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})",
-        r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})",
-        r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, all_text, flags=re.IGNORECASE)
-        if m:
-            yy = m.group(3)
-            year = int(yy)
-            if year < 100:
-                # assume 20xx for statements
-                year += 2000
-            if 1990 <= year <= 2100:
-                return year
-    return None
-
-
-def _extract_opening_balance(lines: List[str]) -> Optional[float]:
-    """
-    Supports:
-      'BEGINNING BALANCE : 50,483.76'
-      'OPENING BALANCE : 12,345.67'
-    """
-    for ln in lines:
-        m = re.search(r"(BEGINNING|OPENING)\s+BALANCE\s*:?\s*([0-9][0-9,]*\.\d{2})", ln, flags=re.IGNORECASE)
-        if m:
-            return _to_float_money(m.group(2))
-    return None
-
-
-def _parse_date_ddmm(token: str, statement_year: int) -> Optional[str]:
-    """
-    token like '01/02' => YYYY-MM-DD using statement year.
-    """
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", token)
-    if not m:
-        return None
-    d = int(m.group(1))
-    mo = int(m.group(2))
-    try:
-        dt = datetime(statement_year, mo, d)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return None
-
-
-def _parse_date_dd_mon_yyyy(tokens: List[str]) -> Optional[Tuple[str, int]]:
-    """
-    tokens like ['01','Feb','2025', ...]
-    returns (YYYY-MM-DD, index_after_date_tokens)
-    """
-    if len(tokens) < 3:
-        return None
-    d, mon, y = tokens[0], tokens[1], tokens[2]
-    if not re.fullmatch(r"\d{1,2}", d):
-        return None
-    if mon.lower()[:3] not in MONTHS:
-        return None
-    if not re.fullmatch(r"\d{4}", y):
-        return None
-
-    day = int(d)
-    month = MONTHS[mon.lower()[:3]]
-    year = int(y)
-    try:
-        dt = datetime(year, month, day)
-        return (dt.strftime("%Y-%m-%d"), 3)
-    except Exception:
-        return None
-
-
-def _last_money_token(tokens: List[str]) -> Optional[float]:
-    """
-    Find last parseable money token in tokens.
-    """
-    for t in reversed(tokens):
-        # allow commas
-        tt = t.strip()
-        if re.fullmatch(r"[0-9][0-9,]*\.\d{2}", tt) or re.fullmatch(r"\.[0-9]{1,2}", tt):
-            val = _to_float_money(tt)
-            if val is not None:
-                return val
-    return None
-
-
-# -----------------------------
-# Core parser
-# -----------------------------
-
-def parse_transactions_maybank(pdf, source_file: str) -> List[Dict]:
-    """
-    Supports BOTH common Maybank layouts encountered in your files:
-      1) Maybank Islamic style: '01 Feb 2025 ... 78.00 - 50,405.76'
-      2) DD/MM style: '01/01 ... 1,980.00 51,142.90' (year taken from statement date)
-
-    Output matches what app.py expects: list of dict with date, description (first line only),
-    debit, credit, balance, page, bank, source_file.
-
-    Debit/Credit is computed from BALANCE DELTA using OPENING/BIGINNING BALANCE.
-    """
-    transactions: List[Dict] = []
-
-    # Collect all lines and also per-page lines
-    all_lines: List[str] = []
-    page_lines: List[List[str]] = []
-
-    for i, page in enumerate(pdf.pages, start=1):
-        text = page.extract_text() or ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        page_lines.append(lines)
-        all_lines.extend(lines)
-
-    all_text = "\n".join(all_lines)
-
-    statement_year = _extract_statement_year(all_text)
-    if statement_year is None:
-        raise ValueError("Statement year not found (cannot resolve DD/MM transaction dates).")
-
-    opening_balance = _extract_opening_balance(all_lines)
-    if opening_balance is None:
-        raise ValueError("Opening/Beginning balance not found.")
-
-    # Patterns:
-    #  A) Islamic line begins with "DD Mon YYYY"
-    #  B) DD/MM line begins with "DD/MM"
-    for page_idx, lines in enumerate(page_lines, start=1):
-        for ln in lines:
-            # skip ending balance line
-            if re.search(r"ENDING\s+BALANCE", ln, flags=re.IGNORECASE):
-                continue
-            # skip opening/beginning balance line
-            if re.search(r"(BEGINNING|OPENING)\s+BALANCE", ln, flags=re.IGNORECASE):
-                continue
-
-            # quick tokenize
-            tokens = ln.split()
-
-            # A) DD Mon YYYY ...
-            date_a = _parse_date_dd_mon_yyyy(tokens)
-            if date_a:
-                date_str, start_idx = date_a
-
-                # Expect last numeric token as balance
-                bal = _last_money_token(tokens)
-                if bal is None:
-                    continue
-
-                # Description = tokens between date and the trailing amount/balance stuff
-                # In Islamic format you often have "... <amount> <sign> <balance>"
-                # We'll remove last 1-3 tokens if they look like [amount] [sign] [balance] or [sign] [balance]
-                desc_tokens = tokens[start_idx:]
-
-                # remove trailing balance token
-                # (find last occurrence of the balance string form is hard; just drop from end by pattern)
-                # If last token is a money, pop it
-                if desc_tokens and re.fullmatch(r"[0-9][0-9,]*\.\d{2}", desc_tokens[-1]):
-                    desc_tokens = desc_tokens[:-1]
-
-                # If there is a trailing sign token ('+' or '-'), drop it
-                if desc_tokens and desc_tokens[-1] in {"+", "-"}:
-                    desc_tokens = desc_tokens[:-1]
-
-                # If there is a trailing amount token, drop it too (we compute debit/credit from balance delta anyway)
-                if desc_tokens and (re.fullmatch(r"[0-9][0-9,]*\.\d{2}", desc_tokens[-1]) or re.fullmatch(r"\.[0-9]{1,2}", desc_tokens[-1])):
-                    desc_tokens = desc_tokens[:-1]
-
-                description = " ".join(desc_tokens).strip()
-                if not description:
-                    # fallback: keep entire line minus date
-                    description = " ".join(tokens[start_idx:]).strip()
-
-                transactions.append({
-                    "date": date_str,
-                    "description": description,  # FIRST LINE ONLY
-                    "debit": 0.0,
-                    "credit": 0.0,
-                    "balance": bal,
-                    "page": page_idx,
-                    "bank": "Maybank",
-                    "source_file": source_file,
-                })
-                continue
-
-            # B) DD/MM ...
-            if tokens and re.fullmatch(r"\d{1,2}/\d{1,2}", tokens[0]):
-                date_str = _parse_date_ddmm(tokens[0], statement_year)
-                if not date_str:
-                    continue
-
-                bal = _last_money_token(tokens)
-                if bal is None:
-                    continue
-
-                # Remove leading date token
-                desc_tokens = tokens[1:]
-
-                # Remove trailing balance token
-                if desc_tokens and re.fullmatch(r"[0-9][0-9,]*\.\d{2}", desc_tokens[-1]):
-                    desc_tokens = desc_tokens[:-1]
-
-                # Remove trailing amount token with optional +/- attached, like '1,980.00+' or '10.00-'
-                # or separate sign token
-                if desc_tokens:
-                    # separate sign token
-                    if desc_tokens[-1] in {"+", "-"}:
-                        desc_tokens = desc_tokens[:-1]
-                    # amount with sign attached
-                    if desc_tokens and re.fullmatch(r"[0-9][0-9,]*\.\d{2}[+-]", desc_tokens[-1]):
-                        desc_tokens = desc_tokens[:-1]
-                    # plain amount
-                    if desc_tokens and re.fullmatch(r"[0-9][0-9,]*\.\d{2}", desc_tokens[-1]):
-                        desc_tokens = desc_tokens[:-1]
-
-                description = " ".join(desc_tokens).strip()
-                if not description:
-                    description = ln
-
-                transactions.append({
-                    "date": date_str,
-                    "description": description,  # FIRST LINE ONLY
-                    "debit": 0.0,
-                    "credit": 0.0,
-                    "balance": bal,
-                    "page": page_idx,
-                    "bank": "Maybank",
-                    "source_file": source_file,
-                })
-                continue
-
-            # Otherwise: continuation lines (multi-line description) -> IGNORE (you want first line only)
-            # So do nothing.
-
-    # If nothing parsed, raise to show issue quickly
-    if not transactions:
-        raise ValueError("No Maybank transactions detected (format not recognized).")
-
-    # Compute debit/credit using balance delta from opening balance
-    prev_bal = opening_balance
-    for tx in transactions:
-        bal = tx.get("balance", None)
-        if bal is None:
-            # can't compute; keep zeros
+    
+    transactions = []
+    opening_balance = None
+    previous_balance = None
+    statement_year = None
+    
+    for page_num, page in enumerate(pdf.pages, start=1):
+        text = page.extract_text()
+        if not text:
             continue
-
-        delta = bal - prev_bal
-        if delta < 0:
-            tx["debit"] = round(-delta, 2)
-            tx["credit"] = 0.0
-        elif delta > 0:
-            tx["debit"] = 0.0
-            tx["credit"] = round(delta, 2)
-        else:
-            tx["debit"] = 0.0
-            tx["credit"] = 0.0
-
-        prev_bal = bal
-
+        
+        lines = text.split('\n')
+        
+        # Extract statement year from first page header
+        if page_num == 1 and statement_year is None:
+            for line in lines[:30]:
+                # Look for date pattern in header (e.g., "31/01/25" or "January 2025")
+                year_match = re.search(r'20\d{2}', line)
+                if year_match:
+                    statement_year = year_match.group(0)
+                    break
+                # Look for short year format
+                date_match = re.search(r'/(\d{2})\s*$', line)
+                if date_match and int(date_match.group(1)) <= 99:
+                    year_short = date_match.group(1)
+                    statement_year = f"20{year_short}"
+                    break
+        
+        if not statement_year:
+            statement_year = "2025"  # Default fallback
+        
+        # Extract opening balance from first page
+        if page_num == 1 and opening_balance is None:
+            for i, line in enumerate(lines):
+                if 'BEGINNING BALANCE' in line.upper():
+                    # Try to extract balance from same line
+                    balance_match = re.search(r'([\d,]+\.\d{2})', line)
+                    if balance_match:
+                        opening_balance = float(balance_match.group(1).replace(',', ''))
+                    else:
+                        # Check next few lines
+                        for j in range(i+1, min(i+3, len(lines))):
+                            balance_match = re.search(r'([\d,]+\.\d{2})', lines[j])
+                            if balance_match:
+                                opening_balance = float(balance_match.group(1).replace(',', ''))
+                                break
+                    
+                    if opening_balance:
+                        previous_balance = opening_balance
+                        
+                        # Add opening balance as first transaction
+                        transactions.append({
+                            'date': '',
+                            'description': 'BEGINNING BALANCE',
+                            'debit': 0.00,
+                            'credit': 0.00,
+                            'balance': round(opening_balance, 2),
+                            'page': page_num,
+                            'bank': 'Maybank Islamic',
+                            'source_file': source_filename
+                        })
+                    break
+        
+        # Parse transaction lines
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Skip empty lines, headers, and footer text
+            if not line or any(skip in line.upper() for skip in [
+                'ENTRY DATE', 'VALUE DATE', 'TRANSACTION DESCRIPTION',
+                'TRANSACTION AMOUNT', 'STATEMENT BALANCE', 'TARIKH',
+                'BUTIR URUSNIAGA', 'JUMLAH', 'BAKI', 'PAGE', 'MUKA',
+                'ACCOUNT NUMBER', 'NOMBOR AKAUN', 'PROTECTED BY PIDM'
+            ]):
+                i += 1
+                continue
+            
+            # Match transaction pattern: DD/MM followed by content
+            match = re.match(r'^(\d{2}/\d{2})\s+(.+)', line)
+            
+            if match:
+                date_str = match.group(1)
+                rest_of_line = match.group(2).strip()
+                
+                # Extract all monetary values (amounts with 2 decimal places)
+                numbers = re.findall(r'([\d,]+\.\d{2})([+-])?', rest_of_line)
+                
+                if len(numbers) >= 1:
+                    # Last number is always the balance
+                    balance_str = numbers[-1][0].replace(',', '')
+                    balance = float(balance_str)
+                    
+                    # Transaction amount (if present, it's second-to-last number)
+                    transaction_amount = 0.00
+                    has_explicit_amount = False
+                    
+                    if len(numbers) >= 2:
+                        transaction_amount = float(numbers[-2][0].replace(',', ''))
+                        has_explicit_amount = True
+                    
+                    # Extract description - everything before the first number
+                    first_num_pos = rest_of_line.find(numbers[0][0])
+                    description = rest_of_line[:first_num_pos].strip()
+                    
+                    # If description is too short, check next line(s) for continuation
+                    if len(description) < 5 and i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        
+                        # Check if next line is a continuation (not a new transaction)
+                        if not re.match(r'^\d{2}/\d{2}', next_line) and next_line:
+                            # Take only the FIRST line of description
+                            desc_candidate = next_line.split('\n')[0].strip()
+                            
+                            # Make sure it's not a number or amount
+                            if not re.match(r'^[\d,]+\.\d{2}', desc_candidate):
+                                # Clean any trailing amounts from description
+                                desc_candidate = re.sub(r'\s*[\d,]+\.\d{2}[+-]?\s*$', '', desc_candidate)
+                                if desc_candidate:
+                                    description = desc_candidate
+                                    i += 1  # Skip the description line we just used
+                    
+                    # Clean description: remove any embedded amounts
+                    description = re.sub(r'[\d,]+\.\d{2}[+-]?', '', description)
+                    description = ' '.join(description.split())  # Normalize whitespace
+                    
+                    # Truncate to first line if multi-line somehow got through
+                    if '\n' in description:
+                        description = description.split('\n')[0].strip()
+                    
+                    # Limit length
+                    description = description[:100] if description else 'TRANSACTION'
+                    
+                    # Determine debit or credit based on balance change
+                    debit = 0.00
+                    credit = 0.00
+                    
+                    if previous_balance is not None:
+                        balance_change = balance - previous_balance
+                        
+                        if balance_change > 0:
+                            # Balance increased = Credit (money in)
+                            credit = transaction_amount if has_explicit_amount else abs(balance_change)
+                        elif balance_change < 0:
+                            # Balance decreased = Debit (money out)
+                            debit = transaction_amount if has_explicit_amount else abs(balance_change)
+                        # If balance_change == 0, both remain 0.00
+                    else:
+                        # Fallback: use explicit amount if available
+                        if has_explicit_amount:
+                            # Check for +/- indicator
+                            if len(numbers) >= 2 and numbers[-2][1] == '+':
+                                credit = transaction_amount
+                            elif len(numbers) >= 2 and numbers[-2][1] == '-':
+                                debit = transaction_amount
+                            else:
+                                # Use keywords in description
+                                desc_upper = description.upper()
+                                credit_keywords = ['DEPOSIT', 'TRANSFER TO', 'CREDIT', 'PAYMENT INTO', 
+                                                 'INTER-BANK PAYMENT INTO', 'CDM CASH DEPOSIT']
+                                debit_keywords = ['TRANSFER FR', 'PAYMENT FR', 'WITHDRAWAL', 'CHARGE',
+                                                'DEBIT', 'PAYMENT DEBIT']
+                                
+                                if any(kw in desc_upper for kw in credit_keywords):
+                                    credit = transaction_amount
+                                elif any(kw in desc_upper for kw in debit_keywords):
+                                    debit = transaction_amount
+                                else:
+                                    # Default: assume debit for safety
+                                    debit = transaction_amount
+                    
+                    # Convert date to full format (DD/MM/YYYY)
+                    try:
+                        full_date_str = f"{date_str}/{statement_year}"
+                        date_obj = datetime.strptime(full_date_str, "%d/%m/%Y")
+                        formatted_date = date_obj.strftime("%Y-%m-%d")
+                    except Exception:
+                        # Fallback to manual parsing
+                        day, month = date_str.split('/')
+                        formatted_date = f"{statement_year}-{month.zfill(2)}-{day.zfill(2)}"
+                    
+                    # Add transaction to list
+                    transactions.append({
+                        'date': formatted_date,
+                        'description': description,
+                        'debit': round(debit, 2),
+                        'credit': round(credit, 2),
+                        'balance': round(balance, 2),
+                        'page': page_num,
+                        'bank': 'Maybank Islamic',
+                        'source_file': source_filename
+                    })
+                    
+                    # Update previous balance for next iteration
+                    previous_balance = balance
+            
+            i += 1
+    
     return transactions
