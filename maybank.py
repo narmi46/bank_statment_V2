@@ -6,26 +6,30 @@ import os
 def parse_transactions_maybank(pdf_input, source_filename):
     """
     PyMuPDF-only extraction.
-    Handles:
+    Works with:
     - filename only
     - full file path
-    - pdfplumber PDF object
+    - pdfplumber PDF object (UPLOAD SAFE)
     """
 
     # ---------------------------------
-    # OPEN PDF SAFELY (CRITICAL FIX)
+    # OPEN PDF SAFELY (FINAL FIX)
     # ---------------------------------
     if isinstance(pdf_input, str):
-        # Case 1: string path or filename
         if os.path.exists(pdf_input):
             doc = fitz.open(pdf_input)
         else:
             raise FileNotFoundError(f"PDF not found on disk: {pdf_input}")
 
     else:
-        # Case 2: pdfplumber object → read bytes
         if hasattr(pdf_input, "stream"):
+            # 🔥 CRITICAL FIX
+            pdf_input.stream.seek(0)
             pdf_bytes = pdf_input.stream.read()
+
+            if not pdf_bytes:
+                raise ValueError("PDF stream is empty after seek()")
+
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         else:
             raise ValueError("Unsupported PDF input type")
