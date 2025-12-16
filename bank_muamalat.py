@@ -3,26 +3,27 @@
 import re
 
 DATE_RE = re.compile(r"\d{1,2}/\d{2}/\d{2}")
-
-# Matches:
-#  .10 | 0.10 | 10.00 | 1,234.56
 AMOUNT_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}")
-
 ZERO_RE = re.compile(r"^0?\.00$")
 
 
 def parse_transactions_bank_muamalat(pdf, source_file):
     """
-    Correct Bank Muamalat parser (pdfplumber).
+    Bank Muamalat parser (balance-delta driven).
 
-    FIXES:
-    - Correct debit vs credit detection
-    - Ignores .00 filler values
-    - Handles 0.xx charges
-    - Right-most amount = balance
+    Debit / Credit decision:
+    1) Extract amount
+    2) Compare current balance vs previous balance
+    3) Delta > 0 => credit, delta < 0 => debit
+
+    This FIXES:
+    - Wrong debit/credit
+    - Broken monthly summary
+    - Fake future months
     """
 
     transactions = []
+    previous_balance = None
 
     for page_num, page in enumerate(pdf.pages, start=1):
 
@@ -31,7 +32,7 @@ def parse_transactions_bank_muamalat(pdf, source_file):
             keep_blank_chars=False
         )
 
-        # Sort visually
+        # Visual order
         words = sorted(words, key=lambda w: (w["top"], w["x0"]))
 
         i = 0
@@ -39,9 +40,9 @@ def parse_transactions_bank_muamalat(pdf, source_file):
 
             text = words[i]["text"]
 
-            # --------------------
+            # -------------------------
             # DATE ANCHOR
-            # --------------------
+            # -------------------------
             if DATE_RE.fullmatch(text):
 
                 y_ref = words[i]["top"]
@@ -51,16 +52,15 @@ def parse_transactions_bank_muamalat(pdf, source_file):
                     if abs(w["top"] - y_ref) <= 2
                 ]
 
-                texts = [w["text"] for w in same_line]
-
+                # Clean description
                 description = " ".join(
-                    t for t in texts
-                    if not DATE_RE.fullmatch(t)
-                    and not AMOUNT_RE.fullmatch(t)
-                    and not ZERO_RE.fullmatch(t)
+                    w["text"] for w in same_line
+                    if not DATE_RE.fullmatch(w["text"])
+                    and not AMOUNT_RE.fullmatch(w["text"])
+                    and not ZERO_RE.fullmatch(w["text"])
                 ).strip()
 
-                # Extract numeric amounts with x position
+                # Numeric values
                 amounts = [
                     (w["x0"], w["text"])
                     for w in same_line
@@ -74,40 +74,47 @@ def parse_transactions_bank_muamalat(pdf, source_file):
 
                 amounts = sorted(amounts, key=lambda x: x[0])
 
-                # --------------------
-                # BALANCE (right-most)
-                # --------------------
-                balance = float(amounts[-1][1].replace(",", ""))
-                txn_amounts = amounts[:-1]
+                # Right-most = balance
+                current_balance = float(amounts[-1][1].replace(",", ""))
+
+                # Transaction amount = last non-balance amount
+                txn_amount = None
+                if len(amounts) > 1:
+                    txn_amount = float(amounts[-2][1].replace(",", ""))
 
                 debit = credit = None
 
-                if txn_amounts:
-                    txn_value = float(txn_amounts[-1][1].replace(",", ""))
+                # -------------------------
+                # BALANCE DELTA DECISION
+                # -------------------------
+                if txn_amount is not None and previous_balance is not None:
+                    delta = current_balance - previous_balance
 
+                    # Allow small rounding tolerance
+                    if delta > 0.0001:
+                        credit = abs(delta)
+                    elif delta < -0.0001:
+                        debit = abs(delta)
+                else:
+                    # fallback for first row
                     desc_upper = description.upper()
-
-                    # --------------------
-                    # CREDIT DETECTION
-                    # --------------------
-                    if (
-                        desc_upper.startswith("CR")
-                        or "PROFIT PAID" in desc_upper
-                    ):
-                        credit = txn_value
+                    if desc_upper.startswith("CR") or "PROFIT PAID" in desc_upper:
+                        credit = txn_amount
                     else:
-                        debit = txn_value
+                        debit = txn_amount
 
                 transactions.append({
                     "date": text,
                     "description": description,
                     "debit": debit,
                     "credit": credit,
-                    "balance": balance,
+                    "balance": current_balance,
                     "page": page_num,
                     "bank": "Bank Muamalat",
                     "source_file": source_file
                 })
+
+                previous_balance = current_balance
 
             i += 1
 
