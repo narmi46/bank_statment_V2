@@ -1,6 +1,7 @@
 # bank_muamalat.py
 
 import re
+from datetime import datetime
 
 DATE_RE = re.compile(r"\d{1,2}/\d{2}/\d{2}")
 AMOUNT_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}")
@@ -9,17 +10,13 @@ ZERO_RE = re.compile(r"^0?\.00$")
 
 def parse_transactions_bank_muamalat(pdf, source_file):
     """
-    Bank Muamalat parser (balance-delta driven).
+    Bank Muamalat parser.
 
-    Debit / Credit decision:
-    1) Extract amount
-    2) Compare current balance vs previous balance
-    3) Delta > 0 => credit, delta < 0 => debit
-
-    This FIXES:
-    - Wrong debit/credit
-    - Broken monthly summary
-    - Fake future months
+    Key features:
+    - Uses date anchor + same-line logic
+    - Right-most amount = balance
+    - Debit/Credit decided by balance delta
+    - Outputs ISO date (YYYY-MM-DD) to FIX monthly summary
     """
 
     transactions = []
@@ -32,7 +29,7 @@ def parse_transactions_bank_muamalat(pdf, source_file):
             keep_blank_chars=False
         )
 
-        # Visual order
+        # sort visually (top → bottom, left → right)
         words = sorted(words, key=lambda w: (w["top"], w["x0"]))
 
         i = 0
@@ -60,7 +57,7 @@ def parse_transactions_bank_muamalat(pdf, source_file):
                     and not ZERO_RE.fullmatch(w["text"])
                 ).strip()
 
-                # Numeric values
+                # Extract numeric amounts
                 amounts = [
                     (w["x0"], w["text"])
                     for w in same_line
@@ -74,10 +71,10 @@ def parse_transactions_bank_muamalat(pdf, source_file):
 
                 amounts = sorted(amounts, key=lambda x: x[0])
 
-                # Right-most = balance
+                # Right-most amount = balance
                 current_balance = float(amounts[-1][1].replace(",", ""))
 
-                # Transaction amount = last non-balance amount
+                # Transaction amount = last non-balance value
                 txn_amount = None
                 if len(amounts) > 1:
                     txn_amount = float(amounts[-2][1].replace(",", ""))
@@ -85,12 +82,11 @@ def parse_transactions_bank_muamalat(pdf, source_file):
                 debit = credit = None
 
                 # -------------------------
-                # BALANCE DELTA DECISION
+                # DEBIT / CREDIT BY BALANCE DELTA
                 # -------------------------
                 if txn_amount is not None and previous_balance is not None:
                     delta = current_balance - previous_balance
 
-                    # Allow small rounding tolerance
                     if delta > 0.0001:
                         credit = abs(delta)
                     elif delta < -0.0001:
@@ -103,8 +99,13 @@ def parse_transactions_bank_muamalat(pdf, source_file):
                     else:
                         debit = txn_amount
 
+                # -------------------------
+                # ISO DATE OUTPUT (CRITICAL FIX)
+                # -------------------------
+                iso_date = datetime.strptime(text, "%d/%m/%y").strftime("%Y-%m-%d")
+
                 transactions.append({
-                    "date": text,
+                    "date": iso_date,  # ✅ FIXED FORMAT
                     "description": description,
                     "debit": debit,
                     "credit": credit,
