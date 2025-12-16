@@ -2,32 +2,27 @@
 
 import re
 
-# ----------------------------
-# REGEX (FIXED)
-# ----------------------------
 DATE_RE = re.compile(r"\d{1,2}/\d{2}/\d{2}")
 
-# Detects:
-#  - 0.10
-#  - .10
-#  - 10.00
-#  - 1,234.56
+# Matches:
+#  .10 | 0.10 | 10.00 | 1,234.56
 AMOUNT_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}")
+
+ZERO_RE = re.compile(r"^0?\.00$")
+
 
 def parse_transactions_bank_muamalat(pdf, source_file):
     """
-    Bank Muamalat parser using pdfplumber.
+    Correct Bank Muamalat parser (pdfplumber).
 
-    Features:
-    - Detects 0.XX amounts correctly
-    - Uses date as anchor
-    - Same Y-line logic
+    FIXES:
+    - Correct debit vs credit detection
+    - Ignores .00 filler values
+    - Handles 0.xx charges
     - Right-most amount = balance
-    - Merges SERVICE CHARGE rows
     """
 
     transactions = []
-    pending_tx = None  # for merging service charges
 
     for page_num, page in enumerate(pdf.pages, start=1):
 
@@ -36,7 +31,7 @@ def parse_transactions_bank_muamalat(pdf, source_file):
             keep_blank_chars=False
         )
 
-        # Sort top → bottom, left → right
+        # Sort visually
         words = sorted(words, key=lambda w: (w["top"], w["x0"]))
 
         i = 0
@@ -44,9 +39,9 @@ def parse_transactions_bank_muamalat(pdf, source_file):
 
             text = words[i]["text"]
 
-            # ----------------------------
+            # --------------------
             # DATE ANCHOR
-            # ----------------------------
+            # --------------------
             if DATE_RE.fullmatch(text):
 
                 y_ref = words[i]["top"]
@@ -58,19 +53,19 @@ def parse_transactions_bank_muamalat(pdf, source_file):
 
                 texts = [w["text"] for w in same_line]
 
-                # Description = non-date, non-amount
-                description_parts = [
+                description = " ".join(
                     t for t in texts
                     if not DATE_RE.fullmatch(t)
                     and not AMOUNT_RE.fullmatch(t)
-                ]
-                description = " ".join(description_parts).strip()
+                    and not ZERO_RE.fullmatch(t)
+                ).strip()
 
-                # Amounts with X position
+                # Extract numeric amounts with x position
                 amounts = [
                     (w["x0"], w["text"])
                     for w in same_line
                     if AMOUNT_RE.fullmatch(w["text"])
+                    and not ZERO_RE.fullmatch(w["text"])
                 ]
 
                 if not amounts:
@@ -79,45 +74,41 @@ def parse_transactions_bank_muamalat(pdf, source_file):
 
                 amounts = sorted(amounts, key=lambda x: x[0])
 
-                # Right-most = balance
+                # --------------------
+                # BALANCE (right-most)
+                # --------------------
                 balance = float(amounts[-1][1].replace(",", ""))
-                remaining = amounts[:-1]
+                txn_amounts = amounts[:-1]
 
                 debit = credit = None
 
-                if len(remaining) == 1:
-                    debit = float(remaining[0][1].replace(",", ""))
-                elif len(remaining) >= 2:
-                    debit = float(remaining[0][1].replace(",", ""))
-                    credit = float(remaining[1][1].replace(",", ""))
+                if txn_amounts:
+                    txn_value = float(txn_amounts[-1][1].replace(",", ""))
 
-                # ----------------------------
-                # SERVICE CHARGE MERGE
-                # ----------------------------
-                if "SERVICE CHARGE" in description.upper() and pending_tx:
-                    pending_tx["service_charge"] += debit or 0.0
-                    pending_tx["balance"] = balance
+                    desc_upper = description.upper()
 
-                else:
-                    tx = {
-                        "date": text,
-                        "description": description,
-                        "debit": debit,
-                        "credit": credit,
-                        "service_charge": 0.0,
-                        "balance": balance,
-                        "page": page_num,
-                        "bank": "Bank Muamalat",
-                        "source_file": source_file
-                    }
-                    transactions.append(tx)
-                    pending_tx = tx
+                    # --------------------
+                    # CREDIT DETECTION
+                    # --------------------
+                    if (
+                        desc_upper.startswith("CR")
+                        or "PROFIT PAID" in desc_upper
+                    ):
+                        credit = txn_value
+                    else:
+                        debit = txn_value
+
+                transactions.append({
+                    "date": text,
+                    "description": description,
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                    "page": page_num,
+                    "bank": "Bank Muamalat",
+                    "source_file": source_file
+                })
 
             i += 1
-
-    # Remove service_charge column if unused
-    for tx in transactions:
-        if tx.get("service_charge") == 0:
-            tx.pop("service_charge", None)
 
     return transactions
