@@ -14,24 +14,36 @@ def parse_transactions_maybank(pdf_input, source_filename):
     doc = open_doc(pdf_input)
 
     # ---------------- BANK NAME / YEAR DETECT ----------------
-    YEAR_RE = re.compile(r"\b(20\d{2})\b")
-    bank_name = "Maybank"
-    statement_year = None
+import re
+from datetime import datetime
 
-    for p in range(min(2, len(doc))):
-        txt = doc[p].get_text("text").upper()
-        if "MAYBANK ISLAMIC" in txt:
-            bank_name = "Maybank Islamic"
-        elif "MAYBANK" in txt:
-            bank_name = "Maybank"
+bank_name = "Maybank"
+statement_year = None
 
-        m = YEAR_RE.search(txt)
-        if m:
-            statement_year = m.group(1)
-            break
+STATEMENT_DATE_RE = re.compile(
+    r"STATEMENT\s+DATE\s*:?\s*(\d{2})/(\d{2})/(\d{2})"
+)
 
-    if not statement_year:
-        statement_year = str(datetime.now().year)
+for p in range(min(2, len(doc))):
+    txt = doc[p].get_text("text").upper()
+
+    # Detect bank type
+    if "MAYBANK ISLAMIC" in txt:
+        bank_name = "Maybank Islamic"
+    elif "MAYBANK" in txt:
+        bank_name = "Maybank"
+
+    # Extract year ONLY from STATEMENT DATE
+    m = STATEMENT_DATE_RE.search(txt)
+    if m:
+        yy = int(m.group(3))
+        statement_year = f"20{yy:02d}"
+        break
+
+# Safe fallback
+if not statement_year:
+    statement_year = str(datetime.now().year)
+
 
     # =========================================================
     # PARSER A: "Classic" Maybank token date formats (old style)
