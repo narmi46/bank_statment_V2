@@ -74,13 +74,25 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
             balance = parse_amount(amounts[-1])
             debit = credit = 0.0
-
+            
+            # CASE 1: Use balance delta when possible (most reliable)
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
                 if delta < 0:
                     debit = abs(delta)
                 elif delta > 0:
                     credit = delta
+            
+            # CASE 2: FIRST ROW → fallback to printed transaction amount
+            elif len(amounts) >= 2:
+                txn_amt = parse_amount(amounts[-2])
+            
+                # Maybank prints DR / minus as debit
+                if "DR" in " ".join(desc_parts).upper() or "DEBIT" in " ".join(desc_parts).upper():
+                    debit = txn_amt
+                else:
+                    debit = txn_amt   # Maybank fees are always debit
+
 
             transactions.append({
                 "date": date_iso,
