@@ -1,17 +1,13 @@
 def parse_transactions_maybank(pdf_input, source_filename):
-    import re
     import fitz
     from datetime import datetime
 
-    # ---------------- REGEX ----------------
-    DATE_RE = re.compile(r"^\d{2}\s+[A-Z][a-z]{2}\s+20\d{2}$")  # 01 Feb 2025
-    AMOUNT_RE = re.compile(r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
+    def is_day(t): return t.isdigit() and 1 <= int(t) <= 31
+    def is_month(t): return t.capitalize() in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    def is_year(t): return t.isdigit() and t.startswith("20")
 
     def parse_amount(v):
         return float(v.replace(",", ""))
-
-    def normalize_date(token):
-        return datetime.strptime(token, "%d %b %Y").strftime("%Y-%m-%d")
 
     # ---------------- OPEN PDF ----------------
     if hasattr(pdf_input, "stream"):
@@ -30,43 +26,50 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
         rows = [{
             "x": w[0],
-            "y": w[1],
+            "y": round(w[1], 1),
             "text": w[4].strip()
         } for w in words if w[4].strip()]
 
-        rows.sort(key=lambda r: (round(r["y"], 1), r["x"]))
+        rows.sort(key=lambda r: (r["y"], r["x"]))
 
-        Y_TOL = 2.0
-        processed_y = set()
+        used_rows = set()
 
-        for r in rows:
-            if not DATE_RE.match(r["text"]):
+        for i in range(len(rows) - 2):
+            w1, w2, w3 = rows[i], rows[i+1], rows[i+2]
+
+            # ✅ Detect split date: 01 Feb 2025
+            if not (is_day(w1["text"]) and is_month(w2["text"]) and is_year(w3["text"])):
                 continue
 
-            y_key = round(r["y"], 1)
-            if y_key in processed_y:
+            y_key = w1["y"]
+            if y_key in used_rows:
                 continue
-
-            line = [w for w in rows if abs(w["y"] - r["y"]) <= Y_TOL]
-            line.sort(key=lambda w: w["x"])
 
             try:
-                date_iso = normalize_date(r["text"])
+                date_iso = datetime.strptime(
+                    f"{w1['text']} {w2['text']} {w3['text']}",
+                    "%d %b %Y"
+                ).strftime("%Y-%m-%d")
             except:
                 continue
+
+            # Collect full row
+            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+            line.sort(key=lambda w: w["x"])
 
             desc_parts = []
             amounts = []
 
             for w in line:
-                if w["text"] == r["text"]:
+                if w in (w1, w2, w3):
                     continue
-                if AMOUNT_RE.match(w["text"]):
-                    amounts.append(w["text"])
+                if w["text"].replace(",", "").replace(".", "").isdigit():
+                    if "." in w["text"]:
+                        amounts.append(w["text"])
                 else:
                     desc_parts.append(w["text"])
 
-            if len(amounts) < 1:
+            if len(amounts) == 0:
                 continue
 
             balance = parse_amount(amounts[-1])
@@ -91,7 +94,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
             })
 
             previous_balance = balance
-            processed_y.add(y_key)
+            used_rows.add(y_key)
 
     doc.close()
     return transactions
