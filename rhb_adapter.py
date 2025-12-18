@@ -1,71 +1,51 @@
-import regex as re
-import rhb
+"""
+RHB Adapter
+-----------
+Allows rhb_v1 (page-level parser) to be used in app_v2 (PDF-level parser)
+WITHOUT modifying rhb_v1.
+"""
 
-# ============================================================
-# OPENING BALANCE (B/F FIRST, SUMMARY SECOND)
-# ============================================================
+# Import the ORIGINAL rhb_v1 parser
+from rhb import parse_transactions_rhb as rhb_v1_parser
 
-BF_BAL_RE = re.compile(
-    r"\d{1,2}\s+[A-Za-z]{3}\s+B/F\s+BALANCE\s+([0-9,]+\.\d{2})(-?)",
-    re.IGNORECASE
-)
-
-OPENING_BAL_RE = re.compile(
-    r"Opening\s+Balance.*?([0-9,]+\.\d{2})(-?)",
-    re.IGNORECASE | re.DOTALL
-)
-
-def _signed(val, minus):
-    v = float(val.replace(",", ""))
-    return -v if minus == "-" else v
-
-
-def extract_opening_balance(text):
-    if not text:
-        return None
-
-    m = BF_BAL_RE.search(text)
-    if m:
-        return _signed(*m.groups())
-
-    m = OPENING_BAL_RE.search(text)
-    if m:
-        return _signed(*m.groups())
-
-    return None
-
-
-# ============================================================
-# ADAPTER ENTRY POINT
-# ============================================================
 
 def parse_transactions_rhb(pdf, source_file):
+    """
+    Adapter function that matches app_v2's expected interface:
+        parse_transactions_rhb(pdf, source_file)
+
+    Internally calls rhb_v1:
+        parse_transactions_rhb(text, page_num, year)
+    """
+
     all_tx = []
 
-    # ---- Detect year ----
+    # -------------------------------------------
+    # Detect year from filename (fallback = 2025)
+    # -------------------------------------------
     year = 2025
     for y in range(2015, 2031):
-        if str(y) in (source_file or ""):
+        if str(y) in source_file:
             year = y
             break
 
-    rhb._prev_balance_global = None
-
+    # -------------------------------------------
+    # Loop through PDF pages (app_v2 style)
+    # -------------------------------------------
     for page_num, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
 
-        if page_num == 1:
-            rhb._prev_balance_global = extract_opening_balance(text)
-            v1_page_num = 0
-        else:
-            v1_page_num = page_num
+        # Call ORIGINAL rhb_v1 parser
+        page_tx = rhb_v1_parser(
+            text,
+            page_num,
+            year
+        )
 
-        page_tx = rhb.parse_transactions_rhb(text, v1_page_num, year)
-
+        # Add app_v2 required metadata
         for tx in page_tx:
             tx["bank"] = "RHB Bank"
             tx["source_file"] = source_file
-            tx["page"] = page_num
             all_tx.append(tx)
 
     return all_tx
