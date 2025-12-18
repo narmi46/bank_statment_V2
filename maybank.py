@@ -13,37 +13,30 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
     doc = open_doc(pdf_input)
 
-    # ---------------- BANK NAME / YEAR DETECT ----------------
-import re
-from datetime import datetime
+    # ---------------- BANK NAME / YEAR DETECT (FIXED) ----------------
+    bank_name = "Maybank"
+    statement_year = None
 
-bank_name = "Maybank"
-statement_year = None
+    STATEMENT_DATE_RE = re.compile(
+        r"STATEMENT\s+DATE\s*:?\s*(\d{2})/(\d{2})/(\d{2})"
+    )
 
-STATEMENT_DATE_RE = re.compile(
-    r"STATEMENT\s+DATE\s*:?\s*(\d{2})/(\d{2})/(\d{2})"
-)
+    for p in range(min(2, len(doc))):
+        txt = doc[p].get_text("text").upper()
 
-for p in range(min(2, len(doc))):
-    txt = doc[p].get_text("text").upper()
+        if "MAYBANK ISLAMIC" in txt:
+            bank_name = "Maybank Islamic"
+        elif "MAYBANK" in txt:
+            bank_name = "Maybank"
 
-    # Detect bank type
-    if "MAYBANK ISLAMIC" in txt:
-        bank_name = "Maybank Islamic"
-    elif "MAYBANK" in txt:
-        bank_name = "Maybank"
+        m = STATEMENT_DATE_RE.search(txt)
+        if m:
+            yy = int(m.group(3))
+            statement_year = f"20{yy:02d}"
+            break
 
-    # Extract year ONLY from STATEMENT DATE
-    m = STATEMENT_DATE_RE.search(txt)
-    if m:
-        yy = int(m.group(3))
-        statement_year = f"20{yy:02d}"
-        break
-
-# Safe fallback
-if not statement_year:
-    statement_year = str(datetime.now().year)
-
+    if not statement_year:
+        statement_year = str(datetime.now().year)
 
     # =========================================================
     # PARSER A: "Classic" Maybank token date formats (old style)
@@ -148,7 +141,6 @@ if not statement_year:
                         elif txn_sign == "-" and txn_val is not None:
                             debit = txn_val
                 else:
-                    # first row fallback (if +/- printed)
                     if txn_sign == "+" and txn_val is not None:
                         credit = txn_val
                     elif txn_sign == "-" and txn_val is not None:
@@ -170,8 +162,7 @@ if not statement_year:
         return transactions
 
     # =========================================================
-    # PARSER B: Islamic-style split-date rows: "01" "Feb" "2025"
-    # + first-row printed amount fallback
+    # PARSER B: Islamic-style split-date rows (unchanged)
     # =========================================================
     MONTHS = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"}
 
@@ -183,7 +174,6 @@ if not statement_year:
         return float(v.replace(",", ""))
 
     def looks_like_money(t):
-        # strict enough to avoid IDs; must contain '.' and be numeric after cleanup
         tt = t.replace(",", "")
         if "." not in tt:
             return False
@@ -230,7 +220,6 @@ if not statement_year:
 
                 desc_parts, amounts = [], []
                 for w in line:
-                    # skip the 3 date tokens
                     if w is w1 or w is w2 or w is w3:
                         continue
                     if looks_like_money(w["text"]):
@@ -251,11 +240,9 @@ if not statement_year:
                     elif delta > 0:
                         credit = delta
                 else:
-                    # FIRST ROW: use printed txn amount if present
                     if len(amounts) >= 2:
                         txn_amt = parse_amount(amounts[-2])
                         desc_up = " ".join(desc_parts).upper()
-                        # Islamic statements often show DR/DEBIT; credits would be CR/CREDIT
                         if ("CR" in desc_up) or ("CREDIT" in desc_up):
                             credit = txn_amt
                         else:
@@ -281,28 +268,25 @@ if not statement_year:
     tx_a = parse_classic()
     tx_b = parse_split_date()
 
-    # Prefer the one that found more transactions
     tx = tx_a if len(tx_a) >= len(tx_b) else tx_b
 
-    # If both found some, merge and dedupe safely
     if tx_a and tx_b:
         seen = set()
         merged = []
         for t in (tx_a + tx_b):
             key = (
-                t.get("date"),
-                t.get("description"),
-                t.get("debit"),
-                t.get("credit"),
-                t.get("balance"),
-                t.get("page"),
-                t.get("source_file"),
+                t["date"],
+                t["description"],
+                t["debit"],
+                t["credit"],
+                t["balance"],
+                t["page"],
+                t["source_file"],
             )
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(t)
+            if key not in seen:
+                seen.add(key)
+                merged.append(t)
         tx = merged
 
     doc.close()
-    return tx 
+    return tx
