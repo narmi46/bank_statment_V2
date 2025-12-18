@@ -31,13 +31,21 @@ def parse_transactions_rhb(pdf_input, source_filename):
         statement_year = str(datetime.now().year)
 
     # ---------------- REGEX ----------------
+    # RHB dates are like 02-04-2025
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    MONEY_RE = re.compile(r"^-?\d{1,3}(?:,\d{3})*\.\d{2}$")
 
-    def parse_money(t):
-        return float(t.replace(",", ""))
+    # Money like: 1,000.00 or 833,810.21- (trailing minus = negative)
+    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}-?$")
 
-    def norm_date(token):
+    def parse_money(t: str) -> float:
+        t = t.strip()
+        neg = t.endswith("-")
+        if neg:
+            t = t[:-1]
+        v = float(t.replace(",", ""))
+        return -v if neg else v
+
+    def norm_date(token: str):
         try:
             return datetime.strptime(token, "%d-%m-%Y").strftime("%Y-%m-%d")
         except:
@@ -46,23 +54,34 @@ def parse_transactions_rhb(pdf_input, source_filename):
     # ---------------- MAIN PARSER ----------------
     transactions = []
     previous_balance = None
-    first_tx_seen = False
+    first_row_done = False
 
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
 
-        # --- detect DR / CR split using header coordinates ---
-        DR_CR_SPLIT_X = None
+        # --- Find header x positions for (DR) and (CR) ---
+        # Header is often split into tokens, so we search for "(DR)" and "(CR)".
+        dr_x = None
+        cr_x = None
         for w in words:
             txt = str(w[4]).upper()
-            if "AMOUNT (CR)" in txt:
-                DR_CR_SPLIT_X = w[0]
+            if "(DR)" in txt and dr_x is None:
+                dr_x = w[0]
+            if "(CR)" in txt and cr_x is None:
+                cr_x = w[0]
+            if dr_x is not None and cr_x is not None:
                 break
 
-        # fallback if header not detected
-        if DR_CR_SPLIT_X is None:
-            DR_CR_SPLIT_X = page.rect.width * 0.6
+        # Fallbacks if header tokens not found
+        if dr_x is None:
+            dr_x = page.rect.width * 0.50
+        if cr_x is None:
+            cr_x = page.rect.width * 0.70
 
+        # Use midpoint between DR and CR headers
+        dr_cr_split_x = (dr_x + cr_x) / 2.0
+
+        # Build sortable row tokens
         rows = [{
             "x": w[0],
             "y": round(w[1], 1),
@@ -85,29 +104,33 @@ def parse_transactions_rhb(pdf_input, source_filename):
             if not date_iso:
                 continue
 
+            # Grab the entire visual line by Y tolerance
             line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
             desc_parts = []
-            amount_words = []
+            money_words = []
 
             for w in line:
                 if w["text"] == token:
                     continue
                 if MONEY_RE.match(w["text"]):
-                    amount_words.append(w)
+                    money_words.append(w)
                 else:
                     desc_parts.append(w["text"])
 
-            if not amount_words:
+            # Need at least balance (and ideally txn amount)
+            if not money_words:
                 continue
 
-            balance_word = amount_words[-1]
+            # Balance is almost always the RIGHTMOST money token
+            money_words_sorted = sorted(money_words, key=lambda w: w["x"])
+            balance_word = money_words_sorted[-1]
             balance = parse_money(balance_word["text"])
 
             debit = credit = 0.0
 
-            # ---------------- NORMAL ROWS ----------------
+            # ---------------- ALL NON-FIRST ROWS (delta logic) ----------------
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
                 if delta > 0:
@@ -117,12 +140,16 @@ def parse_transactions_rhb(pdf_input, source_filename):
 
             # ---------------- FIRST ROW ONLY (coordinate logic) ----------------
             else:
-                if len(amount_words) >= 2:
-                    txn_word = amount_words[-2]
+                # txn amount is typically the money token immediately left of balance
+                # if present; otherwise no txn amount available.
+                txn_word = money_words_sorted[-2] if len(money_words_sorted) >= 2 else None
+
+                if txn_word is not None:
                     txn_amt = abs(parse_money(txn_word["text"]))
 
-                    # decide DR / CR using X coordinate
-                    if txn_word["x"] > DR_CR_SPLIT_X:
+                    # Decide by X coordinate relative to DR/CR split
+                    # left side => DR (debit), right side => CR (credit)
+                    if txn_word["x"] >= dr_cr_split_x:
                         credit = txn_amt
                     else:
                         debit = txn_amt
@@ -140,7 +167,7 @@ def parse_transactions_rhb(pdf_input, source_filename):
 
             previous_balance = balance
             used_y.add(y_key)
-            first_tx_seen = True
+            first_row_done = True
 
     doc.close()
     return transactions
