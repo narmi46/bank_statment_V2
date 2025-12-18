@@ -1,3 +1,16 @@
+import re
+
+def extract_statement_year(text):
+    m = re.search(
+        r"STATEMENT\s+DATE\s*:?\s*\d{2}/\d{2}/(\d{2,4})",
+        text,
+        re.IGNORECASE
+    )
+    if m:
+        y = m.group(1)
+        return int("20" + y) if len(y) == 2 else int(y)
+    return None
+
 def parse_transactions_maybank_islamic(pdf_input, source_filename):
     import fitz
     from datetime import datetime
@@ -55,10 +68,11 @@ def parse_transactions_maybank_islamic(pdf_input, source_filename):
                 continue
 
             try:
-                date_iso = datetime.strptime(
-                    f"{w1['text']} {w2['text']} {w3['text']}",
-                    "%d %b %Y"
-                ).strftime("%Y-%m-%d")
+                date_iso = datetime.strptime( f"{w1['text']} {w2['text']} {statement_year}",
+                "%d %b %Y"
+            )
+                
+            .strftime("%Y-%m-%d")
             except:
                 continue
 
