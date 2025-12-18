@@ -8,6 +8,8 @@ def parse_transactions_maybank(pdf_input, source_filename):
         if hasattr(inp, "stream"):
             inp.stream.seek(0)
             data = inp.stream.read()
+            if not data:
+                raise ValueError("PDF stream is empty")
             return fitz.open(stream=data, filetype="pdf")
         return fitz.open(inp)
 
@@ -34,7 +36,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
         statement_year = str(datetime.now().year)
 
     # =========================================================
-    # PARSER A: "Classic" Maybank token date formats (old style)
+    # PARSER A: Classic Maybank format
     # =========================================================
     DATE_RE_A = re.compile(
         r"^("
@@ -120,7 +122,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
                 if len(amounts) > 1:
                     txn_val, txn_sign = parse_amt_a(amounts[-2][1])
 
-                description = " ".join(desc_parts).strip()
+                description = " ".join(desc_parts)
                 description = " ".join(description.split())[:200]
 
                 debit = credit = 0.0
@@ -131,15 +133,14 @@ def parse_transactions_maybank(pdf_input, source_filename):
                     elif delta < 0:
                         debit = abs(delta)
                     else:
-                        if txn_sign == "+" and txn_val is not None:
+                        if txn_sign == "+" and txn_val:
                             credit = txn_val
-                        elif txn_sign == "-" and txn_val is not None:
+                        elif txn_sign == "-" and txn_val:
                             debit = txn_val
                 else:
-                    # first row fallback (if +/- printed)
-                    if txn_sign == "+" and txn_val is not None:
+                    if txn_sign == "+" and txn_val:
                         credit = txn_val
-                    elif txn_sign == "-" and txn_val is not None:
+                    elif txn_sign == "-" and txn_val:
                         debit = txn_val
 
                 processed_y.add(y_bucket)
@@ -153,13 +154,13 @@ def parse_transactions_maybank(pdf_input, source_filename):
                     "bank": bank_name,
                     "source_file": source_filename
                 })
+
                 previous_balance = balance_val
 
         return transactions
 
     # =========================================================
-    # PARSER B: Islamic-style split-date rows: "01" "Feb" "2025"
-    # + first-row printed amount fallback
+    # PARSER B: Islamic split-date format
     # =========================================================
     MONTHS = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"}
 
@@ -171,7 +172,6 @@ def parse_transactions_maybank(pdf_input, source_filename):
         return float(v.replace(",", ""))
 
     def looks_like_money(t):
-        # strict enough to avoid IDs; must contain '.' and be numeric after cleanup
         tt = t.replace(",", "")
         if "." not in tt:
             return False
@@ -218,8 +218,7 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
                 desc_parts, amounts = [], []
                 for w in line:
-                    # skip the 3 date tokens
-                    if w is w1 or w is w2 or w is w3:
+                    if w in (w1, w2, w3):
                         continue
                     if looks_like_money(w["text"]):
                         amounts.append(w["text"])
@@ -239,12 +238,10 @@ def parse_transactions_maybank(pdf_input, source_filename):
                     elif delta > 0:
                         credit = delta
                 else:
-                    # FIRST ROW: use printed txn amount if present
                     if len(amounts) >= 2:
                         txn_amt = parse_amount(amounts[-2])
                         desc_up = " ".join(desc_parts).upper()
-                        # Islamic statements often show DR/DEBIT; credits would be CR/CREDIT
-                        if ("CR" in desc_up) or ("CREDIT" in desc_up):
+                        if "CR" in desc_up or "CREDIT" in desc_up:
                             credit = txn_amt
                         else:
                             debit = txn_amt
@@ -265,32 +262,26 @@ def parse_transactions_maybank(pdf_input, source_filename):
 
         return transactions
 
-    # ---------------- RUN BOTH + CHOOSE BEST ----------------
+    # ---------------- RUN BOTH + MERGE ----------------
     tx_a = parse_classic()
     tx_b = parse_split_date()
 
-    # Prefer the one that found more transactions
-    tx = tx_a if len(tx_a) >= len(tx_b) else tx_b
-
-    # If both found some, merge and dedupe safely
     if tx_a and tx_b:
         seen = set()
         merged = []
-        for t in (tx_a + tx_b):
+        for t in tx_a + tx_b:
             key = (
-                t.get("date"),
-                t.get("description"),
-                t.get("debit"),
-                t.get("credit"),
-                t.get("balance"),
-                t.get("page"),
-                t.get("source_file"),
+                t["date"], t["description"],
+                t["debit"], t["credit"],
+                t["balance"], t["page"],
+                t["source_file"]
             )
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(t)
+            if key not in seen:
+                seen.add(key)
+                merged.append(t)
         tx = merged
+    else:
+        tx = tx_a if len(tx_a) >= len(tx_b) else tx_b
 
     doc.close()
     return tx
