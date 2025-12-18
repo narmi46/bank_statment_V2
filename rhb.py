@@ -40,7 +40,7 @@ def compute_debit_credit(prev_balance, curr_balance):
 
 
 # ============================================================
-# STRONG B/F & C/F SKIP (ALL FORMATS)
+# SKIP B/F & C/F (ALL FORMATS)
 # ============================================================
 
 PATTERN_BF_CF = re.compile(
@@ -48,9 +48,8 @@ PATTERN_BF_CF = re.compile(
     re.IGNORECASE
 )
 
-
 # ============================================================
-# FORMAT C – RHB ISLAMIC PDF
+# FORMAT C – ISLAMIC (2025+)
 # ============================================================
 
 PATTERN_TX_C = re.compile(
@@ -59,6 +58,31 @@ PATTERN_TX_C = re.compile(
     r"(\d{4,20})\s+"
     r"([0-9,]+\.\d{2})\s+"
     r"([0-9,]+\.\d{2})"
+)
+
+# ============================================================
+# FORMAT A – OLD RETAIL (PRE-2024)
+# ============================================================
+
+PATTERN_TX_A = re.compile(
+    r"^(\d{1,2})\s+([A-Za-z]{3})\s+"
+    r"(.+?)\s+"
+    r"(\d{4,20})\s+"
+    r"([0-9,]+\.\d{2})\s+"
+    r"([0-9,]+\.\d{2})"
+)
+
+# ============================================================
+# FORMAT B – REFLEX / ONLINE
+# ============================================================
+
+PATTERN_TX_B = re.compile(
+    r"(\d{2}-\d{2}-\d{4})\s+"
+    r"\d{3}\s+"
+    r"(.+?)\s+"
+    r"([0-9,]+\.\d{2}|-)\s+"
+    r"([0-9,]+\.\d{2}|-)\s+"
+    r"([0-9,]+\.\d{2})(-?)"
 )
 
 
@@ -71,21 +95,50 @@ def parse_line_rhb(line, page_num, year):
     if not line:
         return None
 
-    # ---- SKIP B/F & C/F ALWAYS ----
+    # ---- Skip B/F & C/F ----
     if PATTERN_BF_CF.search(line):
         return {"type": "bf_cf"}
 
-    # ---- FORMAT C (Islamic) ----
+    # ---- Format C (Islamic) ----
     m = PATTERN_TX_C.match(line)
     if m:
-        day, mon, desc, serial, amt, bal = m.groups()
-        date_fmt = f"{year}-{MONTH_MAP.get(mon, '01')}-{day.zfill(2)}"
+        day, mon, desc, _, _, bal = m.groups()
+        date_fmt = f"{year}-{MONTH_MAP[mon]}-{day.zfill(2)}"
         return {
             "type": "tx",
             "date": date_fmt,
             "description": fix_description(desc),
-            "amount_raw": float(amt.replace(",", "")),
             "balance": float(bal.replace(",", "")),
+            "page": page_num,
+        }
+
+    # ---- Format A (Old Retail) ----
+    m = PATTERN_TX_A.match(line)
+    if m:
+        day, mon, desc, _, _, bal = m.groups()
+        date_fmt = f"{year}-{MONTH_MAP[mon]}-{day.zfill(2)}"
+        return {
+            "type": "tx",
+            "date": date_fmt,
+            "description": fix_description(desc),
+            "balance": float(bal.replace(",", "")),
+            "page": page_num,
+        }
+
+    # ---- Format B (Online / Reflex) ----
+    m = PATTERN_TX_B.search(line)
+    if m:
+        date_raw, desc, _, _, bal, minus = m.groups()
+        dd, mm, yyyy = date_raw.split("-")
+        bal_val = float(bal.replace(",", ""))
+        if minus == "-":
+            bal_val = -bal_val
+
+        return {
+            "type": "tx",
+            "date": f"{yyyy}-{mm}-{dd}",
+            "description": fix_description(desc),
+            "balance": bal_val,
             "page": page_num,
         }
 
