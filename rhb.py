@@ -1,211 +1,173 @@
-import regex as re
+def parse_transactions_rhb(pdf_input, source_filename):
+    import re
+    import fitz
+    from datetime import datetime
 
-# ============================================================
-# MONTH MAP
-# ============================================================
+    # ---------------- OPEN PDF (Streamlit-safe) ----------------
+    def open_doc(inp):
+        if hasattr(inp, "stream"):
+            inp.stream.seek(0)
+            data = inp.stream.read()
+            return fitz.open(stream=data, filetype="pdf")
+        return fitz.open(inp)
 
-MONTH_MAP = {
-    "Jan": "01", "Feb": "02", "Mar": "03",
-    "Apr": "04", "May": "05", "Jun": "06",
-    "Jul": "07", "Aug": "08", "Sep": "09",
-    "Oct": "10", "Nov": "11", "Dec": "12"
-}
+    doc = open_doc(pdf_input)
 
-# ============================================================
-# INTERNAL STATE (PERSISTS ACROSS PAGES)
-# ============================================================
+    # ---------------- BANK NAME / YEAR DETECT ----------------
+    YEAR_RE = re.compile(r"\b(20\d{2})\b")
+    bank_name = "RHB Bank"
+    statement_year = None
 
-_prev_balance_global = None
+    for p in range(min(2, len(doc))):
+        txt = doc[p].get_text("text").upper()
+        if "RHB" in txt:
+            bank_name = "RHB Bank"
+        m = YEAR_RE.search(txt)
+        if m:
+            statement_year = m.group(1)
+            break
 
-# ============================================================
-# SIMPLE DESCRIPTION CLEANER
-# ============================================================
+    if not statement_year:
+        statement_year = str(datetime.now().year)
 
-def fix_description(desc):
-    if not desc:
-        return desc
-    return " ".join(desc.split())
+    # ---------------- REGEX ----------------
+    # RHB dates are like 02-04-2025
+    DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
 
-# ============================================================
-# BALANCE → DEBIT / CREDIT LOGIC
-# ============================================================
+    # Money like: 1,000.00 or 833,810.21- (trailing minus = negative)
+    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}-?$")
 
-def compute_debit_credit(prev_balance, curr_balance):
-    if prev_balance is None:
-        return 0.0, 0.0
-
-    diff = round(curr_balance - prev_balance, 2)
-
-    if diff > 0:
-        return 0.0, diff
-    elif diff < 0:
-        return abs(diff), 0.0
-    return 0.0, 0.0
-
-# ============================================================
-# REGEX PATTERNS
-# ============================================================
-
-# -------- OPENING BALANCE --------
-PATTERN_OPENING_BAL = re.compile(
-    r"Beginning Balance as of .*?([0-9,]+\.\d{2})(-?)",
-    re.IGNORECASE
-)
-
-# -------- FORMAT A (Old RHB PDF) --------
-PATTERN_TX_A = re.compile(
-    r"^(\d{1,2})([A-Za-z]{3})\s+"
-    r"(.+?)\s+"
-    r"(\d{4,20})\s+"
-    r"([0-9,]+\.\d{2})\s+"
-    r"([0-9,]+\.\d{2})"
-)
-
-PATTERN_BF_CF = re.compile(
-    r"^\d{1,2}[A-Za-z]{3}\s+(B/F BALANCE|C/F BALANCE)\s+([0-9,]+\.\d{2})$"
-)
-
-# -------- FORMAT B (Internet Banking) --------
-PATTERN_TX_B = re.compile(
-    r"(\d{2}-\d{2}-\d{4})\s+"
-    r"(\d{3})\s+"
-    r"(.+?)\s+"
-    r"([0-9,]+\.\d{2}|-)\s+"
-    r"([0-9,]+\.\d{2}|-)\s+"
-    r"([0-9,]+\.\d{2})([+-])"
-)
-
-# -------- FORMAT C (Islamic PDF) --------
-PATTERN_TX_C = re.compile(
-    r"^(\d{1,2})\s+([A-Za-z]{3})\s+"
-    r"(.+?)\s+"
-    r"(\d{4,20})\s+"
-    r"([0-9,]+\.\d{2})\s+"
-    r"([0-9,]+\.\d{2})"
-)
-
-# ============================================================
-# PARSE A SINGLE LINE
-# ============================================================
-
-def parse_line_rhb(line, page_num, year=2025):
-    line = line.strip()
-    if not line:
-        return None
-
-    # -------- OPENING BALANCE --------
-    mOB = PATTERN_OPENING_BAL.search(line)
-    if mOB:
-        amt, neg = mOB.groups()
-        bal = float(amt.replace(",", ""))
+    def parse_money(t: str) -> float:
+        t = t.strip()
+        neg = t.endswith("-")
         if neg:
-            bal = -bal
-        return {
-            "type": "opening_balance",
-            "balance": bal
-        }
+            t = t[:-1]
+        v = float(t.replace(",", ""))
+        return -v if neg else v
 
-    # -------- FORMAT C --------
-    mC = PATTERN_TX_C.match(line)
-    if mC:
-        day, mon, desc, serial, amt1, amt2 = mC.groups()
-        date_fmt = f"{year}-{MONTH_MAP.get(mon, '01')}-{day.zfill(2)}"
-        return {
-            "type": "tx",
-            "date": date_fmt,
-            "description": fix_description(desc),
-            "amount_raw": float(amt1.replace(",", "")),
-            "balance": float(amt2.replace(",", "")),
-            "page": page_num,
-        }
+    def norm_date(token: str):
+        try:
+            return datetime.strptime(token, "%d-%m-%Y").strftime("%Y-%m-%d")
+        except:
+            return None
 
-    # -------- FORMAT A --------
-    mA = PATTERN_TX_A.match(line)
-    if mA:
-        day, mon, desc, serial, amt1, amt2 = mA.groups()
-        date_fmt = f"{year}-{MONTH_MAP.get(mon, '01')}-{day.zfill(2)}"
-        return {
-            "type": "tx",
-            "date": date_fmt,
-            "description": fix_description(desc),
-            "amount_raw": float(amt1.replace(",", "")),
-            "balance": float(amt2.replace(",", "")),
-            "page": page_num,
-        }
+    # ---------------- MAIN PARSER ----------------
+    transactions = []
+    previous_balance = None
+    first_row_done = False
 
-    # -------- B/F or C/F --------
-    if PATTERN_BF_CF.match(line):
-        return {"type": "bf_cf"}
+    for page_index, page in enumerate(doc):
+        words = page.get_text("words")
 
-    # -------- FORMAT B --------
-    mB = PATTERN_TX_B.search(line)
-    if mB:
-        date_raw, branch, desc, dr_raw, cr_raw, balance_raw, sign = mB.groups()
-        dd, mm, yyyy = date_raw.split("-")
-        date_fmt = f"{yyyy}-{mm}-{dd}"
+        # --- Find header x positions for (DR) and (CR) ---
+        # Header is often split into tokens, so we search for "(DR)" and "(CR)".
+        dr_x = None
+        cr_x = None
+        for w in words:
+            txt = str(w[4]).upper()
+            if "(DR)" in txt and dr_x is None:
+                dr_x = w[0]
+            if "(CR)" in txt and cr_x is None:
+                cr_x = w[0]
+            if dr_x is not None and cr_x is not None:
+                break
 
-        debit = float(dr_raw.replace(",", "")) if dr_raw != "-" else 0.0
-        credit = float(cr_raw.replace(",", "")) if cr_raw != "-" else 0.0
+        # Fallbacks if header tokens not found
+        if dr_x is None:
+            dr_x = page.rect.width * 0.50
+        if cr_x is None:
+            cr_x = page.rect.width * 0.70
 
-        bal = float(balance_raw.replace(",", ""))
-        if sign == "-":
-            bal = -bal
+        # Use midpoint between DR and CR headers
+        dr_cr_split_x = (dr_x + cr_x) / 2.0
 
-        return {
-            "type": "tx",
-            "date": date_fmt,
-            "description": f"{branch} {desc}",
-            "amount_raw": debit + credit,
-            "balance": bal,
-            "page": page_num,
-        }
+        # Build sortable row tokens
+        rows = [{
+            "x": w[0],
+            "y": round(w[1], 1),
+            "text": str(w[4]).strip()
+        } for w in words if str(w[4]).strip()]
 
-    return None
+        rows.sort(key=lambda r: (r["y"], r["x"]))
+        used_y = set()
 
-# ============================================================
-# MAIN PARSER
-# ============================================================
+        for r in rows:
+            token = r["text"]
+            if not DATE_RE.match(token):
+                continue
 
-def parse_transactions_rhb(text, page_num, year=2025):
-    global _prev_balance_global
+            y_key = r["y"]
+            if y_key in used_y:
+                continue
 
-    # Reset on first page
-    if page_num == 1:
-        _prev_balance_global = None
+            date_iso = norm_date(token)
+            if not date_iso:
+                continue
 
-    tx_list = []
+            # Grab the entire visual line by Y tolerance
+            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+            line.sort(key=lambda w: w["x"])
 
-    for raw_line in text.splitlines():
-        parsed = parse_line_rhb(raw_line, page_num, year)
-        if not parsed:
-            continue
+            desc_parts = []
+            money_words = []
 
-        # -------- OPENING BALANCE --------
-        if parsed["type"] == "opening_balance":
-            _prev_balance_global = parsed["balance"]
-            continue
+            for w in line:
+                if w["text"] == token:
+                    continue
+                if MONEY_RE.match(w["text"]):
+                    money_words.append(w)
+                else:
+                    desc_parts.append(w["text"])
 
-        # -------- SKIP B/F & C/F --------
-        if parsed["type"] == "bf_cf":
-            continue
+            # Need at least balance (and ideally txn amount)
+            if not money_words:
+                continue
 
-        # -------- TRANSACTION --------
-        curr_balance = parsed["balance"]
+            # Balance is almost always the RIGHTMOST money token
+            money_words_sorted = sorted(money_words, key=lambda w: w["x"])
+            balance_word = money_words_sorted[-1]
+            balance = parse_money(balance_word["text"])
 
-        debit, credit = compute_debit_credit(
-            _prev_balance_global,
-            curr_balance
-        )
+            debit = credit = 0.0
 
-        tx_list.append({
-            "date": parsed["date"],
-            "description": parsed["description"],
-            "debit": debit,
-            "credit": credit,
-            "balance": curr_balance,
-            "page": page_num,
-        })
+            # ---------------- ALL NON-FIRST ROWS (delta logic) ----------------
+            if previous_balance is not None:
+                delta = round(balance - previous_balance, 2)
+                if delta > 0:
+                    credit = delta
+                elif delta < 0:
+                    debit = abs(delta)
 
-        _prev_balance_global = curr_balance
+            # ---------------- FIRST ROW ONLY (coordinate logic) ----------------
+            else:
+                # txn amount is typically the money token immediately left of balance
+                # if present; otherwise no txn amount available.
+                txn_word = money_words_sorted[-2] if len(money_words_sorted) >= 2 else None
 
-    return tx_list
+                if txn_word is not None:
+                    txn_amt = abs(parse_money(txn_word["text"]))
+
+                    # Decide by X coordinate relative to DR/CR split
+                    # left side => DR (debit), right side => CR (credit)
+                    if txn_word["x"] >= dr_cr_split_x:
+                        credit = txn_amt
+                    else:
+                        debit = txn_amt
+
+            transactions.append({
+                "date": date_iso,
+                "description": " ".join(desc_parts).strip()[:200],
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2),
+                "page": page_index + 1,
+                "bank": bank_name,
+                "source_file": source_filename
+            })
+
+            previous_balance = balance
+            used_y.add(y_key)
+            first_row_done = True
+
+    doc.close()
+    return transactions
