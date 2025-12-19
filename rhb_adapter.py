@@ -4,7 +4,9 @@ import datetime
 
 BANK_NAME = "RHB Bank"
 
-date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
+# 🔧 FIXED: allow glued dates like 11Mar
+date_re = re.compile(r"^(\d{2})\s*([A-Za-z]{3})")
+
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
@@ -57,17 +59,17 @@ def parse_transactions_rhb(pdf, source_file):
     # -------------------------------------------------
     header_text = pdf.pages[0].extract_text() or ""
 
-    # 1️⃣ Spaced format: "7 Mar 24 – 31 Mar 24"
+    # 1️⃣ spaced: "7 Mar 24 – 31 Mar 24"
     m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
 
-    # 2️⃣ Glued format: "7Mar24–31Mar24"
+    # 2️⃣ glued: "7Mar24–31Mar24"
     if not m:
         m = re.search(r"[A-Za-z]{3}(\d{2})", header_text)
 
     year = int("20" + m.group(1)) if m else datetime.date.today().year
 
     # -------------------------------------------------
-    # Detect column X positions
+    # Detect column X positions (first page is enough)
     # -------------------------------------------------
     debit_x, credit_x, balance_x = detect_columns(pdf.pages[0])
 
@@ -89,7 +91,7 @@ def parse_transactions_rhb(pdf, source_file):
 
         for line in lines:
 
-            # Skip non-transaction rows
+            # Skip summaries & disclaimers
             if is_summary_row(line):
                 continue
 
@@ -111,11 +113,12 @@ def parse_transactions_rhb(pdf, source_file):
                     prev_balance = current["balance"]
 
                 day, mon = dm.groups()
+
                 try:
                     tx_date = datetime.datetime.strptime(
                         f"{day}{mon}{year}", "%d%b%Y"
                     ).date().isoformat()
-                except:
+                except Exception:
                     tx_date = f"{day} {mon} {year}"
 
                 debit = credit = 0.0
@@ -140,7 +143,7 @@ def parse_transactions_rhb(pdf, source_file):
                 else:
                     txn_nums = []
 
-                # Assign by X-axis
+                # Assign debit / credit by X-axis
                 for n in txn_nums:
                     x_mid = (n["x"] + n["x1"]) / 2
                     if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
@@ -148,7 +151,7 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # 🔒 Final authority → balance difference
+                # 🔒 Balance difference fallback
                 if prev_balance is not None and balance is not None:
                     diff = round(balance - prev_balance, 2)
                     if diff > 0:
@@ -158,9 +161,7 @@ def parse_transactions_rhb(pdf, source_file):
                         debit = abs(diff)
                         credit = 0.0
 
-                # -------------------------------------------------
-                # DESCRIPTION: FIRST LINE ONLY
-                # -------------------------------------------------
+                # DESCRIPTION: first line only
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
