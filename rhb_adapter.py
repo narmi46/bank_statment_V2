@@ -31,19 +31,25 @@ def is_summary_row(text: str) -> bool:
 # -------------------------------------------------
 # Detect column X ranges from header
 # -------------------------------------------------
-def detect_columns(page):
-    debit_x = credit_x = balance_x = None
+    def detect_columns(page):
+        debit_x = credit_x = balance_x = None
+    
+        for w in page.extract_words():
+            t = w["text"].lower()
+    
+            if t == "debit":
+                # widen a lot (numbers are right-aligned)
+                debit_x = (w["x0"] - 80, w["x1"] + 120)
+    
+            elif t in ("credit", "kredit"):
+                credit_x = (w["x0"] - 80, w["x1"] + 120)
+    
+            elif t in ("balance", "baki"):
+                # balance is the right-most column → give it more room
+                balance_x = (w["x0"] - 100, w["x1"] + 200)
+    
+        return debit_x, credit_x, balance_x
 
-    for w in page.extract_words():
-        t = w["text"].lower()
-        if t == "debit":
-            debit_x = (w["x0"] - 20, w["x1"] + 60)
-        elif t in ("credit", "kredit"):
-            credit_x = (w["x0"] - 20, w["x1"] + 60)
-        elif t in ("balance", "baki"):
-            balance_x = (w["x0"] - 20, w["x1"] + 100)
-
-    return debit_x, credit_x, balance_x
 
 
 # -------------------------------------------------
