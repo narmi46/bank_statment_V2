@@ -17,6 +17,7 @@ SUMMARY_KEYWORDS = [
     "DEPOSIT ACCOUNT SUMMARY",
     "IMPORTANT NOTES",
     "MEMBER OF PIDM",
+    "ALL INFORMATION AND BALANCES",
 ]
 
 
@@ -50,7 +51,6 @@ def parse_transactions_rhb(pdf, source_file):
     transactions = []
     prev_balance = None
     current = None
-    pending_desc = []
 
     # -------------------------------------------------
     # Detect YEAR from header
@@ -72,7 +72,7 @@ def parse_transactions_rhb(pdf, source_file):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # map line → words
+        # Map line → words
         line_words = {}
         for w in words:
             for line in lines:
@@ -82,7 +82,7 @@ def parse_transactions_rhb(pdf, source_file):
 
         for line in lines:
 
-            # Skip obvious non-transaction rows
+            # Skip non-transaction rows
             if is_summary_row(line):
                 continue
 
@@ -126,6 +126,7 @@ def parse_transactions_rhb(pdf, source_file):
 
                 nums.sort(key=lambda x: x["x"])
 
+                # Rightmost number = balance
                 if nums:
                     balance = nums[-1]["val"]
                     txn_nums = nums[:-1]
@@ -140,7 +141,7 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # 🔒 FINAL AUTHORITY → balance diff
+                # 🔒 Final authority → balance difference
                 if prev_balance is not None and balance is not None:
                     diff = round(balance - prev_balance, 2)
                     if diff > 0:
@@ -150,15 +151,13 @@ def parse_transactions_rhb(pdf, source_file):
                         debit = abs(diff)
                         credit = 0.0
 
-                # Build description
+                # -------------------------------------------------
+                # DESCRIPTION: FIRST LINE ONLY
+                # -------------------------------------------------
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
                 desc = desc.replace(day, "").replace(mon, "").strip()
-
-                if pending_desc:
-                    desc = " ".join(pending_desc) + " " + desc
-                    pending_desc = []
 
                 current = {
                     "date": tx_date,
@@ -172,13 +171,10 @@ def parse_transactions_rhb(pdf, source_file):
                 }
 
             # ==============================
-            # CONTINUATION LINE
+            # CONTINUATION LINE → IGNORE
             # ==============================
             else:
-                if current:
-                    current["description"] += " " + line
-                else:
-                    pending_desc.append(line)
+                continue
 
         if current:
             transactions.append(current)
