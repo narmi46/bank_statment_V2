@@ -6,7 +6,7 @@ from io import BytesIO
 
 
 # ======================================================
-# Helper: read PDF bytes safely (Streamlit / file / bytes)
+# Helper: read PDF bytes safely
 # ======================================================
 def _read_pdf_bytes(pdf_input):
     if isinstance(pdf_input, (bytes, bytearray)):
@@ -16,7 +16,7 @@ def _read_pdf_bytes(pdf_input):
         pdf_input.stream.seek(0)
         return pdf_input.stream.read()
 
-    if hasattr(pdf_input, "read"):  # file-like
+    if hasattr(pdf_input, "read"):
         pdf_input.seek(0)
         return pdf_input.read()
 
@@ -26,8 +26,6 @@ def _read_pdf_bytes(pdf_input):
 
 # ======================================================
 # 1️⃣ RHB ISLAMIC — TEXT BASED
-# Date: 01 Jan
-# Balance: end of line
 # ======================================================
 def _parse_rhb_islamic_text(pdf_bytes):
     transactions = []
@@ -39,7 +37,6 @@ def _parse_rhb_islamic_text(pdf_bytes):
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         header = pdf.pages[0].extract_text() or ""
 
-        # ---- Safe year detection ----
         year = None
         y1 = re.search(r"\b(20\d{2})\b", header)
         y2 = re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b", header)
@@ -49,7 +46,7 @@ def _parse_rhb_islamic_text(pdf_bytes):
         elif y2:
             year = int("20" + y2.group(2))
         else:
-            return []  # fail cleanly
+            return []
 
         for page in pdf.pages:
             text = page.extract_text()
@@ -59,7 +56,6 @@ def _parse_rhb_islamic_text(pdf_bytes):
             for line in text.split("\n"):
                 bal = balance_re.search(line)
                 date = date_re.search(line)
-
                 if not bal or not date:
                     continue
 
@@ -100,8 +96,7 @@ def _parse_rhb_islamic_text(pdf_bytes):
 
 
 # ======================================================
-# 2️⃣ RHB CONVENTIONAL — TEXT BASED (NON-REFLEX)
-# Date: 01Apr
+# 2️⃣ RHB CONVENTIONAL — TEXT BASED
 # ======================================================
 def _parse_rhb_conventional_text(pdf_bytes):
     transactions = []
@@ -126,7 +121,6 @@ def _parse_rhb_conventional_text(pdf_bytes):
             for line in text.split("\n"):
                 bal = balance_re.search(line)
                 date = date_re.search(line)
-
                 if not bal or not date:
                     continue
 
@@ -162,32 +156,92 @@ def _parse_rhb_conventional_text(pdf_bytes):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED
-# Date: 05-02-2025
+# 3️⃣ RHB REFLEX — LAYOUT BASED (FITZ)
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
-    from rhb_reflex import parse_transactions_rhb
-    return parse_transactions_rhb(pdf_bytes, source_filename)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
+
+    def parse_money(t):
+        neg = t.endswith("-")
+        pos = t.endswith("+")
+        t = t[:-1] if neg or pos else t
+        v = float(t.replace(",", ""))
+        return -v if neg else v
+
+    def norm_date(t):
+        return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
+
+    transactions = []
+    previous_balance = None
+
+    for page_index, page in enumerate(doc):
+        words = page.get_text("words")
+        rows = [{"x": w[0], "y": round(w[1], 1), "text": w[4]} for w in words if w[4].strip()]
+        rows.sort(key=lambda r: (r["y"], r["x"]))
+
+        used_y = set()
+
+        for r in rows:
+            if not DATE_RE.match(r["text"]):
+                continue
+
+            y_key = r["y"]
+            if y_key in used_y:
+                continue
+
+            date_iso = norm_date(r["text"])
+            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+
+            money_vals = [w for w in line if MONEY_RE.match(w["text"])]
+            if not money_vals:
+                continue
+
+            balance = parse_money(max(money_vals, key=lambda m: m["x"])["text"])
+
+            if previous_balance is None:
+                previous_balance = balance
+                continue
+
+            delta = balance - previous_balance
+            debit = abs(delta) if delta < 0 else 0
+            credit = delta if delta > 0 else 0
+
+            desc = " ".join(
+                w["text"] for w in line
+                if w["text"] != r["text"] and not MONEY_RE.match(w["text"])
+            )
+
+            transactions.append({
+                "date": date_iso,
+                "description": desc.strip(),
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2)
+            })
+
+            previous_balance = balance
+            used_y.add(y_key)
+
+    doc.close()
+    return transactions
 
 
 # ======================================================
-# 🚦 FINAL ENTRYPOINT (USED BY app.py)
+# 🚦 FINAL ENTRYPOINT (INDEPENDENT FALLBACK)
 # ======================================================
 def parse_transactions_rhb(pdf_input, source_filename=None):
     pdf_bytes = _read_pdf_bytes(pdf_input)
 
-    # Try parsers one by one (INDEPENDENT)
     for parser in (
         _parse_rhb_islamic_text,
         _parse_rhb_conventional_text,
+        lambda b: _parse_rhb_reflex_layout(b, source_filename)
     ):
         tx = parser(pdf_bytes)
         if tx:
             return tx
 
-    # Last resort: Reflex layout parser
-    try:
-        tx = _parse_rhb_reflex_layout(pdf_bytes, source_filename)
-        return tx or []
-    except Exception:
-        return []
+    return []
