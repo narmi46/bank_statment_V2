@@ -1,14 +1,12 @@
 import re
-from datetime import datetime
 
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
     bank_name = "RHB Bank"
 
-    # Example date format: "07 Mar"
-    date_pattern = re.compile(r"^(\d{2}\s[A-Za-z]{3})")
+    date_regex = re.compile(r"^(\d{2})\s([A-Za-z]{3})")
 
-    for page_number, page in enumerate(pdf.pages, start=1):
+    for page_idx, page in enumerate(pdf.pages, start=1):
         text = page.extract_text()
         if not text:
             continue
@@ -18,61 +16,71 @@ def parse_transactions_rhb(pdf, source_file):
         current_tx = None
 
         for line in lines:
-            # Skip table headers and summaries
+
+            # Skip noise
             if any(x in line for x in [
-                "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit",
-                "Balance", "B/F BALANCE", "C/F BALANCE", "Total Count"
+                "ACCOUNT ACTIVITY", "ORDINARY CURRENT ACCOUNT",
+                "Date", "Tarikh", "Debit", "Credit", "Balance",
+                "B/F BALANCE", "C/F BALANCE", "Total Count"
             ]):
                 continue
 
-            # Check if line starts with a date (new transaction)
-            date_match = date_pattern.match(line)
+            date_match = date_regex.match(line)
 
+            # --------------------------------------------------
+            # NEW TRANSACTION LINE
+            # --------------------------------------------------
             if date_match:
                 # Save previous transaction
                 if current_tx:
                     transactions.append(current_tx)
 
-                # Split amounts from right side
                 parts = line.split()
-                date_str = f"{parts[0]} {parts[1]} 2024"  # assume statement year
-                rest = " ".join(parts[2:])
 
-                # Extract amounts (from right)
-                amounts = re.findall(r"[\d,]+\.\d{2}", rest)
-                debit = credit = balance = None
+                day = parts[0]
+                month = parts[1]
+                date_str = f"{day} {month} 2024"  # statement year
 
-                if len(amounts) >= 1:
-                    balance = amounts[-1].replace(",", "")
-                if len(amounts) == 2:
-                    credit = amounts[0].replace(",", "")
-                if len(amounts) >= 3:
-                    debit = amounts[0].replace(",", "")
-                    credit = amounts[1].replace(",", "")
+                # Extract numbers from right
+                amounts = re.findall(r"[\d,]+\.\d{2}", line)
 
-                # Clean description
-                desc = rest
+                debit = credit = balance = 0.0
+
+                if len(amounts) == 1:
+                    balance = float(amounts[0].replace(",", ""))
+                elif len(amounts) == 2:
+                    credit = float(amounts[0].replace(",", ""))
+                    balance = float(amounts[1].replace(",", ""))
+                elif len(amounts) >= 3:
+                    debit = float(amounts[0].replace(",", ""))
+                    credit = float(amounts[1].replace(",", ""))
+                    balance = float(amounts[-1].replace(",", ""))
+
+                # Remove amounts from description
+                desc = line
                 for amt in amounts:
                     desc = desc.replace(amt, "")
-                desc = desc.strip()
+                desc = desc.replace(day, "").replace(month, "").strip()
 
                 current_tx = {
                     "date": date_str,
                     "description": desc,
-                    "debit": float(debit) if debit else 0.0,
-                    "credit": float(credit) if credit else 0.0,
-                    "balance": float(balance) if balance else None,
-                    "page": page_number,
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                    "page": page_idx,
                     "bank": bank_name,
                     "source_file": source_file
                 }
 
+            # --------------------------------------------------
+            # DESCRIPTION CONTINUATION
+            # --------------------------------------------------
             else:
-                # Continuation of description
                 if current_tx:
                     current_tx["description"] += " " + line
 
-        # Append last transaction on page
+        # Save last tx on page
         if current_tx:
             transactions.append(current_tx)
 
