@@ -28,24 +28,36 @@ def is_summary_row(text: str) -> bool:
 # YEAR DETECTION (STRICT)
 # =================================================
 def detect_year(pdf):
+    """
+    Robust year detection for RHB statements (Islamic & Conventional).
+    Handles:
+    - '7 Mar 24 – 31 Mar 24'
+    - '7 Mar24–31 Mar24'
+    - '01/03/2024 - 31/03/2024'
+    """
+
     text = pdf.pages[0].extract_text() or ""
+    text_upper = text.upper()
 
-    # 1️⃣ Prefer full year (2024)
-    m = re.search(r"\b(20\d{2})\b", text)
+    # 1️⃣ Narrow search to Statement Period line (most reliable)
+    for line in text_upper.splitlines():
+        if "STATEMENT PERIOD" in line or "TEMPOH PENYATA" in line:
+            # Try full year first (2024)
+            m = re.search(r"(20\d{2})", line)
+            if m:
+                return int(m.group(1))
+
+            # Fallback: short year (24)
+            m = re.search(r"\b(\d{2})\b", line)
+            if m:
+                return int("20" + m.group(1))
+
+    # 2️⃣ Global fallback (last resort)
+    m = re.search(r"(20\d{2})", text)
     if m:
         return int(m.group(1))
 
-    # 2️⃣ Fallback: short year (24)
-    m = re.search(r"\b(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})\b", text)
-    if m:
-        return int("20" + m.group(2))
-
-    # 3️⃣ Fallback: numeric date (01/03/2024)
-    m = re.search(r"\b\d{1,2}/\d{1,2}/(20\d{2})\b", text)
-    if m:
-        return int(m.group(1))
-
-    # ❌ Hard fail only if everything fails
+    # ❌ If everything fails
     raise ValueError("❌ Statement year not detected – unsupported statement format")
 
 # =================================================
