@@ -5,7 +5,7 @@ import datetime
 # =================================================
 # COMMON CONFIG
 # =================================================
-date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})\b")
+date_re = re.compile(r"^(\d{2})\s*([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
