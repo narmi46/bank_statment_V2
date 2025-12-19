@@ -1,37 +1,43 @@
 import re
-import fitz
+import pdfplumber
 from datetime import datetime
 
-def open_pdf(inp):
-    if hasattr(inp, "stream"):  # Streamlit upload
-        inp.stream.seek(0)
-        return fitz.open(stream=inp.stream.read(), filetype="pdf")
-    return fitz.open(inp)
 
-
-def parse_money(t):
+def parse_money(t: str) -> float:
     try:
         return float(t.replace(",", ""))
     except Exception:
         return 0.0
 
+
+def extract_year_from_header(pdf):
+    header = pdf.pages[0].extract_text()
+
+    # Matches: 1Jan25, 1 Jan 25, 1Apr24
+    m = re.search(r"\d{1,2}\s*[A-Za-z]{3}\s*(\d{2})", header)
+    if not m:
+        return None
+
+    return int("20" + m.group(1))
+
+
 #Parser 1: RHB REFLEX (YOUR WORKING LOGIC)
 
-def parse_rhb_reflex(doc, source_filename):
+def parse_rhb_reflex(pdf, source_filename):
     transactions = []
     previous_balance = None
 
     DATE_RE = re.compile(r"\d{2}-\d{2}-\d{4}")
     MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
 
-    for page_index, page in enumerate(doc):
-        words = page.get_text("words")
+    for page_index, page in enumerate(pdf.pages):
+        words = page.extract_words(use_text_flow=True)
 
         rows = [{
-            "x": w[0],
-            "y": round(w[1], 1),
-            "text": w[4].strip()
-        } for w in words if w[4].strip()]
+            "x": w["x0"],
+            "y": round(w["top"], 1),
+            "text": w["text"].strip()
+        } for w in words if w["text"].strip()]
 
         rows.sort(key=lambda r: (r["y"], r["x"]))
         used_y = set()
@@ -44,7 +50,9 @@ def parse_rhb_reflex(doc, source_filename):
             if y in used_y:
                 continue
 
-            date_iso = datetime.strptime(r["text"], "%d-%m-%Y").strftime("%Y-%m-%d")
+            date_iso = datetime.strptime(
+                r["text"], "%d-%m-%Y"
+            ).strftime("%Y-%m-%d")
 
             line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
@@ -78,9 +86,9 @@ def parse_rhb_reflex(doc, source_filename):
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
                 "balance": round(balance, 2),
-                "page": page_index + 1,
                 "bank": "RHB Reflex",
-                "source_file": source_filename
+                "source_file": source_filename,
+                "page": page_index + 1
             })
 
             previous_balance = balance
@@ -88,25 +96,22 @@ def parse_rhb_reflex(doc, source_filename):
 
     return transactions
 
+
 #Parser 2: RHB CONVENTIONAL
 
-def parse_rhb_conventional(doc, source_filename):
+def parse_rhb_conventional(pdf, source_filename):
     transactions = []
     previous_balance = None
 
-    DATE_RE = re.compile(r"(\d{2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
-    MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
-    YEAR_RE = re.compile(r"\d{1,2}\s+\w+\s+(\d{2})")
-
-    header_text = doc[0].get_text()
-    y = YEAR_RE.search(header_text)
-    if not y:
+    year = extract_year_from_header(pdf)
+    if not year:
         return []
 
-    year = int("20" + y.group(1))
+    DATE_RE = re.compile(r"(\d{2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
+    MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
 
-    for page_index, page in enumerate(doc):
-        lines = page.get_text().split("\n")
+    for page_index, page in enumerate(pdf.pages):
+        lines = page.extract_text().split("\n")
 
         for line in lines:
             if not MONEY_RE.search(line):
@@ -124,7 +129,9 @@ def parse_rhb_conventional(doc, source_filename):
                 continue
 
             day, mon = dm.groups()
-            date_iso = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y").strftime("%Y-%m-%d")
+            date_iso = datetime.strptime(
+                f"{day} {mon} {year}", "%d %b %Y"
+            ).strftime("%Y-%m-%d")
 
             balance = parse_money(MONEY_RE.findall(line)[-1])
 
@@ -145,9 +152,9 @@ def parse_rhb_conventional(doc, source_filename):
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
                 "balance": round(balance, 2),
-                "page": page_index + 1,
                 "bank": "RHB Conventional",
-                "source_file": source_filename
+                "source_file": source_filename,
+                "page": page_index + 1
             })
 
             previous_balance = balance
@@ -156,23 +163,19 @@ def parse_rhb_conventional(doc, source_filename):
 
 #Parser 3: RHB ISLAMIC
 
-def parse_rhb_islamic(doc, source_filename):
+def parse_rhb_islamic(pdf, source_filename):
     transactions = []
     previous_balance = None
 
-    DATE_RE = re.compile(r"(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
-    MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
-    YEAR_RE = re.compile(r"\d{1,2}\s+Jan\s+(\d{2})")
-
-    header_text = doc[0].get_text()
-    y = YEAR_RE.search(header_text)
-    if not y:
+    year = extract_year_from_header(pdf)
+    if not year:
         return []
 
-    year = int("20" + y.group(1))
+    DATE_RE = re.compile(r"(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
+    MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
 
-    for page_index, page in enumerate(doc):
-        lines = page.get_text().split("\n")
+    for page_index, page in enumerate(pdf.pages):
+        lines = page.extract_text().split("\n")
 
         for line in lines:
             if not MONEY_RE.search(line):
@@ -190,7 +193,9 @@ def parse_rhb_islamic(doc, source_filename):
                 continue
 
             day, mon = dm.groups()
-            date_iso = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y").strftime("%Y-%m-%d")
+            date_iso = datetime.strptime(
+                f"{day} {mon} {year}", "%d %b %Y"
+            ).strftime("%Y-%m-%d")
 
             balance = parse_money(MONEY_RE.findall(line)[-1])
 
@@ -211,9 +216,9 @@ def parse_rhb_islamic(doc, source_filename):
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
                 "balance": round(balance, 2),
-                "page": page_index + 1,
                 "bank": "RHB Islamic",
-                "source_file": source_filename
+                "source_file": source_filename,
+                "page": page_index + 1
             })
 
             previous_balance = balance
@@ -223,7 +228,11 @@ def parse_rhb_islamic(doc, source_filename):
 #Dispatcher (THIS IS THE KEY)
 
 def parse_transactions_rhb(pdf_input, source_filename):
-    doc = open_pdf(pdf_input)
+    # Open PDF ONCE using pdfplumber
+    if hasattr(pdf_input, "read"):
+        pdf = pdfplumber.open(pdf_input)
+    else:
+        pdf = pdfplumber.open(pdf_input)
 
     for parser in (
         parse_rhb_reflex,
@@ -231,12 +240,12 @@ def parse_transactions_rhb(pdf_input, source_filename):
         parse_rhb_conventional,
     ):
         try:
-            txns = parser(doc, source_filename)
+            txns = parser(pdf, source_filename)
             if txns:
-                doc.close()
+                pdf.close()
                 return txns
         except Exception:
             continue
 
-    doc.close()
+    pdf.close()
     return []
