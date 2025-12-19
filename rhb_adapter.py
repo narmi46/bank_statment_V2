@@ -29,7 +29,7 @@ def is_summary_row(text: str) -> bool:
 
 
 # -------------------------------------------------
-# Detect column X ranges (WIDE & SAFE)
+# Detect column X ranges (wide)
 # -------------------------------------------------
 def detect_columns(page):
     debit_x = credit_x = balance_x = None
@@ -39,10 +39,8 @@ def detect_columns(page):
 
         if t == "debit":
             debit_x = (w["x0"] - 80, w["x1"] + 140)
-
         elif t in ("credit", "kredit"):
             credit_x = (w["x0"] - 80, w["x1"] + 140)
-
         elif t in ("balance", "baki"):
             balance_x = (w["x0"] - 120, w["x1"] + 260)
 
@@ -50,12 +48,13 @@ def detect_columns(page):
 
 
 # -------------------------------------------------
-# MAIN PARSER (NO GUESSING)
+# MAIN PARSER
 # -------------------------------------------------
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
     prev_balance = None
     current = None
+    first_tx = True  # 🔑 key flag
 
     # -------------------------------------------------
     # Detect YEAR (spaced & glued)
@@ -88,7 +87,7 @@ def parse_transactions_rhb(pdf, source_file):
 
         for line in lines:
 
-            # Skip summaries / headers
+            # Skip summaries & headers
             if is_summary_row(line):
                 continue
 
@@ -103,7 +102,7 @@ def parse_transactions_rhb(pdf, source_file):
             if not dm:
                 continue
 
-            # Skip B/F and C/F rows
+            # Skip B/F and C/F
             up = line.upper()
             if "B/F" in up or "C/F" in up:
                 continue
@@ -131,34 +130,37 @@ def parse_transactions_rhb(pdf, source_file):
                     x_mid = (w["x0"] + w["x1"]) / 2
                     nums.append((float(txt), x_mid))
 
-            # Assign by coordinate ONLY
-            for val, x_mid in nums:
-                if balance_x and balance_x[0] <= x_mid <= balance_x[1]:
-                    balance = val
-                elif debit_x and debit_x[0] <= x_mid <= debit_x[1]:
-                    debit = val
-                elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
-                    credit = val
+            # -------------------------------------------------
+            # FIRST TRANSACTION → USE COORDINATES
+            # -------------------------------------------------
+            if first_tx:
+                for val, x_mid in nums:
+                    if balance_x and balance_x[0] <= x_mid <= balance_x[1]:
+                        balance = val
+                    elif debit_x and debit_x[0] <= x_mid <= debit_x[1]:
+                        debit = val
+                    elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
+                        credit = val
 
-            # ⚠️ BALANCE-DIFF AS FALLBACK ONLY (NO GUESSING)
-            if (
-                balance is not None
-                and prev_balance is not None
-                and debit == 0.0
-                and credit == 0.0
-            ):
-                diff = round(balance - prev_balance, 2)
-                if diff > 0:
-                    credit = diff
-                elif diff < 0:
-                    debit = abs(diff)
+                first_tx = False
 
-            # If balance missing → DO NOT GUESS
-            if balance is None:
-                debit = debit or 0.0
-                credit = credit or 0.0
+            # -------------------------------------------------
+            # ALL OTHER TRANSACTIONS → USE BALANCE DIFF ONLY
+            # -------------------------------------------------
+            else:
+                # extract balance only (rightmost in range)
+                for val, x_mid in nums:
+                    if balance_x and balance_x[0] <= x_mid <= balance_x[1]:
+                        balance = val
 
-            # Clean description (first line only)
+                if balance is not None and prev_balance is not None:
+                    diff = round(balance - prev_balance, 2)
+                    if diff > 0:
+                        credit = diff
+                    elif diff < 0:
+                        debit = abs(diff)
+
+            # Clean description
             desc = line
             desc = re.sub(num_re, "", desc)
             desc = desc.replace(day, "").replace(mon, "")
@@ -172,9 +174,7 @@ def parse_transactions_rhb(pdf, source_file):
                 "balance": round(balance, 2) if balance is not None else None,
                 "page": page_no,
                 "bank": BANK_NAME,
-                "source_file": source_file,
-                # helpful flag
-                "is_suspect": balance is None or (debit == 0 and credit == 0)
+                "source_file": source_file
             }
 
         if current:
