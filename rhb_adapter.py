@@ -200,8 +200,16 @@ def parse_transactions_rhb(pdf, source_file):
                 # Sort by X coordinate (left to right)
                 amounts_with_coords.sort(key=lambda x: x['x'])
                 
+                # Balance is ALWAYS the rightmost amount - extract it first
+                if amounts_with_coords:
+                    balance = amounts_with_coords[-1]['value']
+                    # Remove balance from the list for debit/credit detection
+                    transaction_amounts = amounts_with_coords[:-1] if len(amounts_with_coords) > 1 else []
+                else:
+                    transaction_amounts = []
+                
                 # METHOD 1: Assign based on X-coordinate ranges
-                for amt_data in amounts_with_coords:
+                for amt_data in transaction_amounts:
                     x_mid = (amt_data['x'] + amt_data['x1']) / 2
                     val = amt_data['value']
                     
@@ -212,14 +220,25 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x_range and credit_x_range[0] <= x_mid <= credit_x_range[1]:
                         if credit == 0.0:
                             credit = val
-                    elif balance_x_range and balance_x_range[0] <= x_mid <= balance_x_range[1]:
-                        balance = val
                 
-                # If balance not found, use rightmost amount
-                if balance is None and amounts_with_coords:
-                    balance = amounts_with_coords[-1]['value']
+                # METHOD 2 (Fallback): Check for CR/DR indicators in description
+                if debit == 0.0 and credit == 0.0:
+                    # Look for "CR" (credit) or "DR" (debit) indicators in the line
+                    line_upper = line.upper()
+                    has_cr_indicator = bool(re.search(r'\bCR\b', line_upper))
+                    has_dr_indicator = bool(re.search(r'\bDR\b', line_upper))
+                    
+                    # If we have amounts and indicators, use them
+                    if transaction_amounts and (has_cr_indicator or has_dr_indicator):
+                        # Use first transaction amount (balance already extracted above)
+                        amount_value = transaction_amounts[0]['value']
+                        
+                        if has_cr_indicator:
+                            credit = amount_value
+                        elif has_dr_indicator:
+                            debit = amount_value
                 
-                # METHOD 2 (Fallback): Use balance calculation
+                # METHOD 3 (Final Fallback): Use balance calculation
                 if debit == 0.0 and credit == 0.0 and balance is not None and prev_balance is not None:
                     diff = balance - prev_balance
                     if abs(diff) > 0.01:  # Tolerance for floating point
