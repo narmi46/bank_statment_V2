@@ -5,12 +5,10 @@ from datetime import datetime
 
 def parse_transactions_rhb(pdf_input, source_filename):
     """
-    Unified RHB Bank + RHB Islamic PDF parser
+    Unified RHB Bank PDF parser
     - Streamlit-safe
-    - Auto year detection
-    - Uses B/F balance only as opening
-    - Balance-delta debit/credit
-    - Supports both Ordinary & Islamic formats
+    - Accurate Beginning Balance detection
+    - Balance-delta based debit/credit calculation
     """
 
     # ---------------- OPEN PDF ----------------
@@ -23,34 +21,59 @@ def parse_transactions_rhb(pdf_input, source_filename):
     doc = open_doc(pdf_input)
 
     # ---------------- REGEX ----------------
-    DATE_ISO_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    DATE_TXN_RE = re.compile(r"(\d{2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
-    MONEY_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}")
-    HEADER_YEAR_RE = re.compile(r"\d{1,2}\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*(\d{2})")
+    DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
 
     # ---------------- HELPERS ----------------
     def parse_money(t: str) -> float:
+        neg = t.endswith("-")
+        pos = t.endswith("+")
+        t = t[:-1] if neg or pos else t
         try:
-            return float(t.replace(",", ""))
-        except Exception:
+            v = float(t.replace(",", ""))
+            return -v if neg else v
+        except ValueError:
             return 0.0
 
-    # ==========================================================
-    # STEP 1: AUTO-DETECT YEAR FROM PAGE 1
-    # ==========================================================
-    first_page_text = doc[0].get_text()
-    year_match = HEADER_YEAR_RE.search(first_page_text)
+    def norm_date(t: str) -> str:
+        return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    if not year_match:
-        raise ValueError("Unable to detect year from PDF header")
+    # ==========================================================
+    # STEP 1: FIND OPENING BALANCE (X + Y AXIS BASED)
+    # ==========================================================
+    opening_balance = None
+    first_page = doc[0]
+    words = first_page.get_text("words")
 
-    year = int("20" + year_match.group(2))
+    rows = [{
+        "x": w[0],
+        "y": round(w[1], 1),
+        "text": w[4].strip()
+    } for w in words if w[4].strip()]
+
+    for r in rows:
+        text = r["text"].upper()
+        if "BEGINNING" in text and "BALANCE" in text:
+            y_ref = r["y"]
+            x_ref = r["x"]
+
+            same_line_money = [
+                w for w in rows
+                if abs(w["y"] - y_ref) <= 1.5
+                and w["x"] > x_ref
+                and MONEY_RE.match(w["text"])
+            ]
+
+            if same_line_money:
+                same_line_money.sort(key=lambda w: w["x"])
+                opening_balance = parse_money(same_line_money[-1]["text"])
+            break
 
     # ==========================================================
     # STEP 2: TRANSACTION PARSER
     # ==========================================================
     transactions = []
-    previous_balance = None
+    previous_balance = opening_balance
 
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
@@ -65,22 +88,15 @@ def parse_transactions_rhb(pdf_input, source_filename):
         used_y = set()
 
         for r in rows:
-            # --------- DATE DETECTION ---------
-            date_match = DATE_TXN_RE.search(r["text"])
-            if not date_match:
+            if not DATE_RE.match(r["text"]):
                 continue
 
             y_key = r["y"]
             if y_key in used_y:
                 continue
 
-            day, month = date_match.groups()
-            date_iso = datetime.strptime(
-                f"{day} {month} {year}",
-                "%d %b %Y"
-            ).strftime("%Y-%m-%d")
+            date_iso = norm_date(r["text"])
 
-            # --------- COLLECT LINE ---------
             line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
@@ -88,14 +104,12 @@ def parse_transactions_rhb(pdf_input, source_filename):
             money_vals = []
 
             for w in line:
-                t = w["text"]
-
-                if DATE_TXN_RE.search(t):
+                if w["text"] == r["text"]:
                     continue
-                if MONEY_RE.fullmatch(t):
+                if MONEY_RE.match(w["text"]):
                     money_vals.append(w)
-                elif not t.isdigit():
-                    description.append(t)
+                elif not w["text"].isdigit():
+                    description.append(w["text"])
 
             if not money_vals:
                 continue
@@ -103,19 +117,6 @@ def parse_transactions_rhb(pdf_input, source_filename):
             # Rightmost money = balance
             balance = parse_money(max(money_vals, key=lambda m: m["x"])["text"])
 
-            # --------- B/F & C/F HANDLING ---------
-            desc_joined = " ".join(description).upper()
-
-            if "B/F" in desc_joined:
-                previous_balance = balance
-                used_y.add(y_key)
-                continue
-
-            if "C/F" in desc_joined or "(RM)" in desc_joined or "TOTAL" in desc_joined:
-                used_y.add(y_key)
-                continue
-
-            # --------- DEBIT / CREDIT ---------
             debit = credit = 0.0
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
