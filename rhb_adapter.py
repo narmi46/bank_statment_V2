@@ -1,10 +1,11 @@
-# rhb_adapter.py
 import re
 import datetime
 
 BANK_NAME = "RHB Bank"
 
+# Matches "DD MMM" at the start of a line
 date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
+# Matches currency formatted numbers (e.g., 1,000.00)
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
@@ -20,19 +21,15 @@ SUMMARY_KEYWORDS = [
     "ALL INFORMATION AND BALANCES",
 ]
 
-
 def is_summary_row(text: str) -> bool:
     text = text.upper()
     return any(k in text for k in SUMMARY_KEYWORDS)
 
-
-# -------------------------------------------------
-# Detect column X ranges from header
-# -------------------------------------------------
 def detect_columns(page):
     debit_x = credit_x = balance_x = None
-
-    for w in page.extract_words():
+    words = page.extract_words()
+    
+    for w in words:
         t = w["text"].lower()
         if t == "debit":
             debit_x = (w["x0"] - 20, w["x1"] + 60)
@@ -43,62 +40,48 @@ def detect_columns(page):
 
     return debit_x, credit_x, balance_x
 
-
-# -------------------------------------------------
-# MAIN PARSER
-# -------------------------------------------------
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
     prev_balance = None
     current = None
 
     # -------------------------------------------------
-    # Detect YEAR from header
+    # Robust Year Detection (Handles both formats)
     # -------------------------------------------------
     header_text = pdf.pages[0].extract_text() or ""
-    m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
-    year = int("20" + m.group(1)) if m else datetime.date.today().year
+    # Looks for 'MMM YY-' or 'MMM YY ' patterns 
+    m = re.search(r"([A-Za-z]{3})\s+(\d{2})[\s\-–]", header_text)
+    year = int("20" + m.group(2)) if m else datetime.date.today().year
 
-    # -------------------------------------------------
-    # Detect column X positions
-    # -------------------------------------------------
+    # Detect column X positions from the first page header
     debit_x, credit_x, balance_x = detect_columns(pdf.pages[0])
 
-    # -------------------------------------------------
-    # Parse pages
-    # -------------------------------------------------
     for page_no, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # Map line → words
+        # Group words by their vertical position (line)
         line_words = {}
         for w in words:
-            for line in lines:
-                if w["text"] in line:
-                    line_words.setdefault(line, []).append(w)
-                    break
+            # Simple heuristic: round the top coordinate to group words on the same line
+            y_coord = round(w["top"])
+            line_words.setdefault(y_coord, []).append(w)
 
         for line in lines:
-
-            # Skip non-transaction rows
+            # Skip summary and header noise [cite: 12, 22, 133, 151]
             if is_summary_row(line):
                 continue
-
-            if any(h in line for h in [
-                "ACCOUNT ACTIVITY", "Date", "Tarikh",
-                "Debit", "Credit", "Balance",
-                "Page No", "Statement Period"
-            ]):
+            if any(h in line for h in ["ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit", "Balance", "Page No"]):
                 continue
 
             dm = date_re.match(line)
 
             # ==============================
-            # DATE LINE → new transaction
+            # DATE LINE → New Transaction
             # ==============================
             if dm:
+                # If a previous transaction was being built, save it
                 if current:
                     transactions.append(current)
                     prev_balance = current["balance"]
@@ -114,8 +97,16 @@ def parse_transactions_rhb(pdf, source_file):
                 debit = credit = 0.0
                 balance = None
 
+                # Find words belonging to this specific text line to check coordinates
+                current_line_words = []
+                for y in line_words:
+                    line_str = " ".join([w["text"] for w in sorted(line_words[y], key=lambda x: x["x0"])])
+                    if line in line_str or line_str in line:
+                        current_line_words = line_words[y]
+                        break
+
                 nums = []
-                for w in line_words.get(line, []):
+                for w in current_line_words:
                     txt = w["text"].replace(",", "")
                     if num_re.fullmatch(txt):
                         nums.append({
@@ -126,14 +117,14 @@ def parse_transactions_rhb(pdf, source_file):
 
                 nums.sort(key=lambda x: x["x"])
 
-                # Rightmost number = balance
+                # Rightmost number is the Balance 
                 if nums:
                     balance = nums[-1]["val"]
                     txn_nums = nums[:-1]
                 else:
                     txn_nums = []
 
-                # Assign by X-axis
+                # Assign Debit/Credit based on X-axis coordinates
                 for n in txn_nums:
                     x_mid = (n["x"] + n["x1"]) / 2
                     if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
@@ -141,23 +132,19 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # 🔒 Final authority → balance difference
+                # Arithmetic Validation using balance difference [cite: 22]
                 if prev_balance is not None and balance is not None:
                     diff = round(balance - prev_balance, 2)
                     if diff > 0:
-                        credit = diff
-                        debit = 0.0
+                        credit, debit = diff, 0.0
                     elif diff < 0:
-                        debit = abs(diff)
-                        credit = 0.0
+                        debit, credit = abs(diff), 0.0
 
-                # -------------------------------------------------
-                # DESCRIPTION: FIRST LINE ONLY
-                # -------------------------------------------------
+                # Extract only the first line of the description
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
-                desc = desc.replace(day, "").replace(mon, "").strip()
+                desc = desc.replace(day, "", 1).replace(mon, "", 1).strip()
 
                 current = {
                     "date": tx_date,
@@ -171,14 +158,14 @@ def parse_transactions_rhb(pdf, source_file):
                 }
 
             # ==============================
-            # CONTINUATION LINE → IGNORE
+            # CONTINUATION LINE → IGNORE (As requested)
             # ==============================
             else:
+                # We do not append to current["description"] here to stick to Line 1 only.
                 continue
 
-        if current:
-            transactions.append(current)
-            prev_balance = current["balance"]
-            current = None
+    # Append the very last transaction of the file
+    if current:
+        transactions.append(current)
 
     return transactions
