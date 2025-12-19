@@ -38,7 +38,8 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
         header = pdf.pages[0].extract_text() or ""
 
         year = None
-        y1 = re.search(r"\b(20\d{2})\b", header)
+        #y1 = re.search(r"\b(20\d{2})\b", header)
+        y1 = re.search(r"\d{1,2}\s*[A-Za-z]{3}\s*\d{2}", header)
         y2 = re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b", header)
 
         if y1:
