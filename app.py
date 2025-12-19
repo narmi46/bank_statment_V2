@@ -10,7 +10,7 @@ from io import BytesIO
 # ---------------------------------------------------
 from maybank import parse_transactions_maybank
 from public_bank import parse_transactions_pbb
-from rhb_adapter import parse_transactions_rhb
+from rhb import parse_transactions_rhb
 from cimb import parse_transactions_cimb
 from bank_islam import parse_bank_islam
 from bank_rakyat import parse_bank_rakyat
