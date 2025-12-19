@@ -182,14 +182,18 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 # ======================================================
 # 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED
 # ======================================================
+import fitz
+import re
+from datetime import datetime
+
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
-    previous_balance = None
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
     MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
+    OPEN_BAL_RE = re.compile(r"Beginning Balance.*?([\d,]+\.\d{2}[+-])")
 
     def parse_money(t):
         neg = t.endswith("-")
@@ -201,6 +205,19 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     def norm_date(t):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
+    # --------------------------------------------------
+    # 1️⃣ Extract opening balance (from first page)
+    # --------------------------------------------------
+    previous_balance = None
+    first_page_text = doc[0].get_text()
+
+    m = OPEN_BAL_RE.search(first_page_text.replace("\n", " "))
+    if m:
+        previous_balance = parse_money(m.group(1))
+
+    # --------------------------------------------------
+    # 2️⃣ Parse transaction rows
+    # --------------------------------------------------
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
         rows = [{"x": w[0], "y": round(w[1], 1), "text": w[4]} for w in words if w[4].strip()]
@@ -224,13 +241,16 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
             balance = parse_money(max(money_vals, key=lambda m: m["x"])["text"])
 
+            # --------------------------------------------------
+            # 3️⃣ Debit / Credit calculation
+            # --------------------------------------------------
             if previous_balance is None:
-                previous_balance = balance
-                continue
+                delta = 0.0
+            else:
+                delta = balance - previous_balance
 
-            delta = balance - previous_balance
-            debit = abs(delta) if delta < 0 else 0
-            credit = delta if delta > 0 else 0
+            debit = abs(delta) if delta < 0 else 0.0
+            credit = delta if delta > 0 else 0.0
 
             desc = " ".join(
                 w["text"] for w in line
@@ -253,6 +273,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     doc.close()
     return transactions
+
 
 
 # ======================================================
