@@ -2,119 +2,119 @@ import re
 from datetime import datetime
 
 def parse_transactions_rhb(pdf, source_filename):
-    # ---------------- REGEX & HELPERS ----------------
+    """
+    Parses RHB transactions using a pdfplumber object.
+    Fixes the missing first credit by accurately locating the 'Beginning Balance'.
+    """
+    # ---------------- REGEX ----------------
+    DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    # Matches money like 1,234.56 or 1,234.56-
     MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
-    REFLEX_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    CURRENT_DATE_RE = re.compile(r"^\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$")
 
+    # ---------------- HELPERS ----------------
     def parse_money(t: str) -> float:
         if not t: return 0.0
         t = t.strip()
         neg = t.endswith("-")
+        # Remove suffix and commas
         clean_t = t[:-1] if neg or t.endswith("+") else t
         try:
             v = float(clean_t.replace(",", ""))
             return -v if neg else v
-        except ValueError: return 0.0
+        except ValueError:
+            return 0.0
 
-    # ---------------- FORMAT DETECTION ----------------
-    first_page_text = pdf.pages[0].extract_text()
-    # Check for "Reflex" keywords [cite: 7, 15]
-    is_reflex = "REFLEX" in first_page_text.upper() or "21413800157991" in first_page_text
+    def norm_date(t: str) -> str:
+        return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    # =========================================================================
-    # OPTION 1: REFLEX FORMAT (e.g., Clear Water Services)
-    # =========================================================================
-    if is_reflex:
-        opening_balance = None
-        words = pdf.pages[0].extract_words()
-        words.sort(key=lambda w: (round(w['top'], 1), w['x0']))
+    # ==========================================================
+    # STEP 1: FIND OPENING BALANCE
+    # ==========================================================
+    opening_balance = None
+    first_page = pdf.pages[0]
+    words = first_page.extract_words()
+    
+    # Sort words to reconstruct lines
+    words.sort(key=lambda w: (round(w['top'], 1), w['x0']))
+
+    for i, w in enumerate(words):
+        text = w['text'].upper()
+        if "BEGINNING" in text:
+            # Check context for "BEGINNING BALANCE"
+            context = " ".join([word['text'].upper() for word in words[i:i+5]])
+            if "BEGINNING BALANCE" in context:
+                # Look ahead for the first money string (the balance amount)
+                for search_idx in range(i, min(i + 15, len(words))):
+                    item_text = words[search_idx]['text']
+                    if MONEY_RE.match(item_text):
+                        opening_balance = parse_money(item_text)
+                        break
+                if opening_balance is not None:
+                    break
+
+    # ==========================================================
+    # STEP 2: TRANSACTION PARSER
+    # ==========================================================
+    transactions = []
+    previous_balance = opening_balance
+
+    for page in pdf.pages:
+        page_words = page.extract_words()
+        # Group words by line (using 'top' coordinate)
+        lines_dict = {}
+        for w in page_words:
+            y = round(w['top'], 1)
+            lines_dict.setdefault(y, []).append(w)
         
-        for i, w in enumerate(words):
-            if "BEGINNING" in w['text'].upper():
-                context = " ".join([word['text'].upper() for word in words[i:i+5]])
-                if "BEGINNING BALANCE" in context:
-                    for search_idx in range(i, min(i + 15, len(words))):
-                        if MONEY_RE.match(words[search_idx]['text']):
-                            opening_balance = parse_money(words[search_idx]['text']) # [cite: 17, 18]
-                            break
-                    if opening_balance is not None: break
+        sorted_y = sorted(lines_dict.keys())
 
-        transactions = []
-        previous_balance = opening_balance
-        for page in pdf.pages:
-            page_words = page.extract_words()
-            lines = {}
-            for w in page_words:
-                y = round(w['top'], 1)
-                lines.setdefault(y, []).append(w)
+        for y in sorted_y:
+            line = sorted(lines_dict[y], key=lambda w: w['x0'])
+            first_word = line[0]['text'].strip()
+
+            if not DATE_RE.match(first_word):
+                continue
+
+            date_iso = norm_date(first_word)
             
-            for y in sorted(lines.keys()):
-                line = sorted(lines[y], key=lambda w: w['x0'])
-                if not line or not REFLEX_DATE_RE.match(line[0]['text'].strip()): continue
-                
-                date_iso = datetime.strptime(line[0]['text'].strip(), "%d-%m-%Y").strftime("%Y-%m-%d")
-                money_vals = [w for w in line if MONEY_RE.match(w['text'])]
-                desc = " ".join([w['text'] for w in line if not MONEY_RE.match(w['text']) and not REFLEX_DATE_RE.match(w['text'])])
-                
-                if not money_vals: continue
-                balance = parse_money(max(money_vals, key=lambda m: m['x0'])['text'])
-                
-                debit = credit = 0.0
-                if previous_balance is not None:
-                    delta = round(balance - previous_balance, 2)
-                    if delta > 0: credit = delta
-                    elif delta < 0: debit = abs(delta)
-
-                transactions.append({
-                    "date": date_iso, "description": desc[:200], "debit": round(debit, 2),
-                    "credit": round(credit, 2), "balance": round(balance, 2),
-                    "page": page.page_number, "bank": "RHB Bank (Reflex)", "source_file": source_filename
-                })
-                previous_balance = balance
-        return transactions
-
-    # =========================================================================
-    # OPTION 2: CURRENT ACCOUNT FORMAT (e.g., Azlan Boutique)
-    # =========================================================================
-    else:
-        # Detect year from header (e.g., "7 Mar 24" -> "2024") [cite: 36]
-        year_match = re.search(r"Tempoh Penyata:.*?\s(\d{2})$", first_page_text, re.MULTILINE)
-        year_val = "20" + year_match.group(1) if year_match else "2024"
-
-        transactions = []
-        for page in pdf.pages:
-            page_words = page.extract_words()
-            lines = {}
-            for w in page_words:
-                y = round(w['top'], 1)
-                lines.setdefault(y, []).append(w)
+            # Extract values from line
+            description_parts = []
+            money_vals = []
             
-            for y in sorted(lines.keys()):
-                line = sorted(lines[y], key=lambda w: w['x0'])
-                if not line or not CURRENT_DATE_RE.match(line[0]['text']): continue
-                
-                date_raw = line[0]['text']
-                desc_upper = " ".join([w['text'].upper() for w in line])
-                if "B/F BALANCE" in desc_upper or "C/F BALANCE" in desc_upper: continue # 
+            for w in line[1:]:
+                txt = w['text'].strip()
+                if MONEY_RE.match(txt):
+                    money_vals.append(w)
+                elif not txt.isdigit():
+                    description_parts.append(txt)
 
-                # Map specific X-axis positions for Azlan Boutique layout 
-                debit = credit = balance = 0.0
-                for w in line:
-                    if MONEY_RE.match(w['text']):
-                        x = w['x0']
-                        val = parse_money(w['text'])
-                        if x > 500: balance = val # Balance column 
-                        elif 410 < x <= 500: credit = val # Credit column 
-                        elif 320 < x <= 410: debit = val # Debit column 
+            if not money_vals:
+                continue
 
-                try:
-                    date_iso = datetime.strptime(f"{date_raw} {year_val}", "%d %b %Y").strftime("%Y-%m-%d")
-                    transactions.append({
-                        "date": date_iso,
-                        "description": " ".join([w['text'] for w in line if not MONEY_RE.match(w['text']) and not CURRENT_DATE_RE.match(w['text'])])[:200],
-                        "debit": abs(debit), "credit": abs(credit), "balance": balance,
-                        "page": page.page_number, "bank": "RHB Bank (Current)", "source_file": source_filename
-                    })
-                except: continue
-        return transactions
+            # Rightmost money is always the balance in RHB statements
+            balance_text = max(money_vals, key=lambda m: m['x0'])['text']
+            balance = parse_money(balance_text)
+
+            debit = credit = 0.0
+            if previous_balance is not None:
+                delta = round(balance - previous_balance, 2)
+                if delta > 0:
+                    credit = delta
+                elif delta < 0:
+                    debit = abs(delta)
+
+            transactions.append({
+                "date": date_iso,
+                "description": " ".join(description_parts)[:200],
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2),
+                "page": page.page_number,
+                "bank": "RHB Bank",
+                "source_file": source_filename
+            })
+            
+            previous_balance = balance
+
+    return transactions
+    
