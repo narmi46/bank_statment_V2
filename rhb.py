@@ -103,40 +103,52 @@ def parse_transactions_rhb(pdf, source_filename):
     # OPTION 2: ORDINARY CURRENT ACCOUNT FORMAT (e.g., Azlan Boutique)
     # =========================================================================
     else:
-        # Detect Year from 'Tempoh Penyata' header
-        year_match = re.search(r"Tempoh Penyata:.*?\s(\d{2})$", first_page_text, re.MULTILINE)
-        year_val = "20" + year_match.group(1) if year_match else "2024"
+        # Improved Year Detection: Looks for '7 Mar 24' or similar in the header
+        year_val = "2024" 
+        header_match = re.search(r"Tempoh Penyata:\s+\d{1,2}\s+\w{3}\s+(\d{2})", first_page_text)
+        if header_match:
+            year_val = "20" + header_match.group(1)
 
         transactions = []
         for page in pdf.pages:
+            # Using a more robust table extraction setting for grid layouts
             table = page.extract_table({
                 "vertical_strategy": "text", 
-                "horizontal_strategy": "lines"
+                "horizontal_strategy": "lines",
+                "intersection_y_tolerance": 10 # Helps catch multi-line descriptions
             })
+            
             if not table: continue
             
             for row in table:
+                # Filter out None/empty and strip whitespace
                 row = [str(c).strip() if c else "" for c in row]
-                # Validate date format (e.g., "07 Mar")
+                
+                # Check for the date format "07 Mar" [cite: 52]
                 if len(row) < 6 or not CURRENT_DATE_RE.match(row[0]): 
                     continue
                 
-                # Skip B/F and C/F lines
+                # Skip summary lines [cite: 52, 113]
                 desc_upper = row[1].upper()
-                if "B/F BALANCE" in desc_upper or "C/F BALANCE" in desc_upper:
+                if any(x in desc_upper for x in ["B/F BALANCE", "C/F BALANCE", "TOTAL COUNT"]):
                     continue
                 
-                date_iso = datetime.strptime(f"{row[0]} {year_val}", "%d %b %Y").strftime("%Y-%m-%d")
-                
-                # In this format, Debit/Credit are explicit columns
-                transactions.append({
-                    "date": date_iso,
-                    "description": row[1].replace("\n", " ")[:200],
-                    "debit": parse_money(row[3]),
-                    "credit": parse_money(row[4]),
-                    "balance": parse_money(row[5]),
-                    "page": page.page_number,
-                    "bank": "RHB Bank (Current)",
-                    "source_file": source_filename
-                })
+                try:
+                    # Normalize date using detected year 
+                    date_obj = datetime.strptime(f"{row[0]} {year_val}", "%d %b %Y")
+                    date_iso = date_obj.strftime("%Y-%m-%d")
+                    
+                    transactions.append({
+                        "date": date_iso,
+                        "description": row[1].replace("\n", " ")[:200],
+                        "debit": parse_money(row[3]), # [cite: 52]
+                        "credit": parse_money(row[4]), # [cite: 52]
+                        "balance": parse_money(row[5]), # [cite: 52]
+                        "page": page.page_number,
+                        "bank": "RHB Bank (Current)",
+                        "source_file": source_filename
+                    })
+                except Exception:
+                    continue
+                    
         return transactions
