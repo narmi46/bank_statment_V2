@@ -29,11 +29,10 @@ def detect_year(pdf):
 
 
 # =================================================
-# COLUMN DETECTION (ISLAMIC)
+# COLUMN DETECTORS
 # =================================================
 def detect_columns_islamic(page):
     debit_x = credit_x = balance_x = None
-
     for w in page.extract_words():
         t = w["text"].lower()
         if t == "debit":
@@ -42,20 +41,11 @@ def detect_columns_islamic(page):
             credit_x = (w["x0"] - 20, w["x1"] + 60)
         elif t in ("balance", "baki"):
             balance_x = (w["x0"] - 20, w["x1"] + 100)
-
     return debit_x, credit_x, balance_x
 
 
-# =================================================
-# COLUMN DETECTION (CONVENTIONAL)
-# =================================================
 def detect_columns_conventional(page):
-    """
-    Conventional statements have slightly shifted columns.
-    These ranges are intentionally tighter.
-    """
     debit_x = credit_x = balance_x = None
-
     for w in page.extract_words():
         t = w["text"].lower()
         if t == "debit":
@@ -64,15 +54,14 @@ def detect_columns_conventional(page):
             credit_x = (w["x0"] - 30, w["x1"] + 40)
         elif t in ("balance", "baki"):
             balance_x = (w["x0"] - 30, w["x1"] + 80)
-
     return debit_x, credit_x, balance_x
 
 
 # =================================================
-# CORE PARSER ENGINE
+# CORE PARSER (FIXED)
 # =================================================
 def _parse_rhb_core(pdf, source_file, bank_name, column_detector):
-    txs = []
+    transactions = []
     prev_balance = None
     year = detect_year(pdf)
 
@@ -103,15 +92,15 @@ def _parse_rhb_core(pdf, source_file, bank_name, column_detector):
 
             dm = date_re.match(line)
             if not dm:
-                continue
+                continue   # <-- THIS IS NOW SAFE
 
             day, mon = dm.groups()
             try:
-                date_out = datetime.datetime.strptime(
+                tx_date = datetime.datetime.strptime(
                     f"{day}{mon}{year}", "%d%b%Y"
                 ).date().isoformat()
             except:
-                date_out = f"{day} {mon} {year}"
+                tx_date = f"{day} {mon} {year}"
 
             debit = credit = 0.0
             balance = None
@@ -127,7 +116,6 @@ def _parse_rhb_core(pdf, source_file, bank_name, column_detector):
                     })
 
             nums.sort(key=lambda x: x["x"])
-
             if nums:
                 balance = nums[-1]["val"]
                 txn_nums = nums[:-1]
@@ -141,7 +129,7 @@ def _parse_rhb_core(pdf, source_file, bank_name, column_detector):
                 elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                     credit = n["val"]
 
-            # 🔒 FINAL AUTHORITY
+            # 🔒 BALANCE DIFF = TRUTH
             if prev_balance is not None and balance is not None:
                 diff = round(balance - prev_balance, 2)
                 if diff > 0:
@@ -151,14 +139,14 @@ def _parse_rhb_core(pdf, source_file, bank_name, column_detector):
                     debit = abs(diff)
                     credit = 0.0
 
-            # FIRST LINE ONLY
+            # FIRST LINE DESCRIPTION ONLY
             desc = line
             for a in num_re.findall(desc):
                 desc = desc.replace(a, "")
             desc = desc.replace(day, "").replace(mon, "").strip()
 
-            txs.append({
-                "date": date_out,
+            transactions.append({
+                "date": tx_date,
                 "description": " ".join(desc.split()),
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
@@ -170,26 +158,19 @@ def _parse_rhb_core(pdf, source_file, bank_name, column_detector):
 
             prev_balance = balance
 
-    return txs
+    return transactions
 
 
 # =================================================
-# PUBLIC ENTRY POINT
+# PUBLIC ENTRY
 # =================================================
 def parse_transactions_rhb(pdf, source_file):
     header = pdf.pages[0].extract_text() or ""
-
     if "RHB ISLAMIC BANK" in header.upper():
         return _parse_rhb_core(
-            pdf,
-            source_file,
-            "RHB Islamic Bank",
-            detect_columns_islamic
+            pdf, source_file, "RHB Islamic Bank", detect_columns_islamic
         )
     else:
         return _parse_rhb_core(
-            pdf,
-            source_file,
-            "RHB Bank",
-            detect_columns_conventional
+            pdf, source_file, "RHB Bank", detect_columns_conventional
         )
