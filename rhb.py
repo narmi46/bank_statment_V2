@@ -27,7 +27,7 @@ def _read_pdf_bytes(pdf_input):
 # ======================================================
 # 1️⃣ RHB ISLAMIC — TEXT BASED
 # ======================================================
-def _parse_rhb_islamic_text(pdf_bytes):
+def _parse_rhb_islamic_text(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
 
@@ -46,9 +46,9 @@ def _parse_rhb_islamic_text(pdf_bytes):
         elif y2:
             year = int("20" + y2.group(2))
         else:
-            return []
+            return []  # clean fail
 
-        for page in pdf.pages:
+        for page_index, page in enumerate(pdf.pages):
             text = page.extract_text()
             if not text:
                 continue
@@ -87,7 +87,10 @@ def _parse_rhb_islamic_text(pdf_bytes):
                     "description": desc,
                     "debit": round(debit, 2),
                     "credit": round(credit, 2),
-                    "balance": round(balance, 2)
+                    "balance": round(balance, 2),
+                    "page": page_index + 1,
+                    "bank": "RHB Bank",
+                    "source_file": source_filename
                 })
 
                 previous_balance = balance
@@ -96,9 +99,9 @@ def _parse_rhb_islamic_text(pdf_bytes):
 
 
 # ======================================================
-# 2️⃣ RHB CONVENTIONAL — TEXT BASED
+# 2️⃣ RHB CONVENTIONAL — TEXT BASED (NON-REFLEX)
 # ======================================================
-def _parse_rhb_conventional_text(pdf_bytes):
+def _parse_rhb_conventional_text(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
 
@@ -113,7 +116,7 @@ def _parse_rhb_conventional_text(pdf_bytes):
 
         year = int("20" + ym.group(1))
 
-        for page in pdf.pages:
+        for page_index, page in enumerate(pdf.pages):
             text = page.extract_text()
             if not text:
                 continue
@@ -147,7 +150,10 @@ def _parse_rhb_conventional_text(pdf_bytes):
                     "description": desc,
                     "debit": round(debit, 2),
                     "credit": round(credit, 2),
-                    "balance": round(balance, 2)
+                    "balance": round(balance, 2),
+                    "page": page_index + 1,
+                    "bank": "RHB Bank",
+                    "source_file": source_filename
                 })
 
                 previous_balance = balance
@@ -156,9 +162,12 @@ def _parse_rhb_conventional_text(pdf_bytes):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX — LAYOUT BASED (FITZ)
+# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
+    transactions = []
+    previous_balance = None
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
@@ -174,14 +183,10 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     def norm_date(t):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    transactions = []
-    previous_balance = None
-
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
         rows = [{"x": w[0], "y": round(w[1], 1), "text": w[4]} for w in words if w[4].strip()]
         rows.sort(key=lambda r: (r["y"], r["x"]))
-
         used_y = set()
 
         for r in rows:
@@ -219,7 +224,10 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "description": desc.strip(),
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
-                "balance": round(balance, 2)
+                "balance": round(balance, 2),
+                "page": page_index + 1,
+                "bank": "RHB Bank",
+                "source_file": source_filename
             })
 
             previous_balance = balance
@@ -230,17 +238,17 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 🚦 FINAL ENTRYPOINT (INDEPENDENT FALLBACK)
+# 🚦 FINAL ENTRYPOINT — INDEPENDENT FALLBACK
 # ======================================================
-def parse_transactions_rhb(pdf_input, source_filename=None):
+def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
 
     for parser in (
         _parse_rhb_islamic_text,
         _parse_rhb_conventional_text,
-        lambda b: _parse_rhb_reflex_layout(b, source_filename)
+        _parse_rhb_reflex_layout,
     ):
-        tx = parser(pdf_bytes)
+        tx = parser(pdf_bytes, source_filename)
         if tx:
             return tx
 
