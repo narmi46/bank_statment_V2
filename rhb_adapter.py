@@ -53,18 +53,18 @@ def parse_transactions_rhb(pdf, source_file):
     current = None
 
     # -------------------------------------------------
-    # Detect YEAR from header
+    # Detect YEAR from header (supports BOTH formats)
     # -------------------------------------------------
     header_text = pdf.pages[0].extract_text() or ""
 
-    # 1️⃣ Normal spaced format: "7 Mar 24 – 31 Mar 24"
+    # 1️⃣ Spaced format: "7 Mar 24 – 31 Mar 24"
     m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
-    
-    # 2️⃣ Fallback for glued format: "7Mar24–31Mar24"
-        if not m:
-            m = re.search(r"[A-Za-z]{3}(\d{2})", header_text)
-        
-        year = int("20" + m.group(1)) if m else datetime.date.today().year
+
+    # 2️⃣ Glued format: "7Mar24–31Mar24"
+    if not m:
+        m = re.search(r"[A-Za-z]{3}(\d{2})", header_text)
+
+    year = int("20" + m.group(1)) if m else datetime.date.today().year
 
     # -------------------------------------------------
     # Detect column X positions
