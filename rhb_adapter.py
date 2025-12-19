@@ -45,7 +45,7 @@ def detect_columns(page):
             credit_x = (w["x0"] - 80, w["x1"] + 120)
 
         elif t in ("balance", "baki"):
-            balance_x = (w["x0"] - 100, w["x1"] + 200)
+            balance_x = (w["x0"] - 100, w["x1"] + 220)
 
     return debit_x, credit_x, balance_x
 
