@@ -228,7 +228,9 @@ def parse_rhb_islamic(pdf, source_filename):
 #Dispatcher (THIS IS THE KEY)
 
 def parse_transactions_rhb(pdf_input, source_filename):
-    # Open PDF ONCE using pdfplumber
+    import pdfplumber
+
+    # ✅ ALWAYS convert UploadedFile → pdfplumber.PDF HERE
     if hasattr(pdf_input, "read"):
         pdf = pdfplumber.open(pdf_input)
     else:
@@ -240,11 +242,13 @@ def parse_transactions_rhb(pdf_input, source_filename):
         parse_rhb_conventional,
     ):
         try:
-            txns = parser(pdf, source_filename)
+            txns = parser(pdf, source_filename)  # ✅ pdf, not pdf_input
             if txns:
                 pdf.close()
                 return txns
-        except Exception:
+        except Exception as e:
+            # TEMP DEBUG (keep during testing)
+            print(f"{parser.__name__} failed:", e)
             continue
 
     pdf.close()
