@@ -169,6 +169,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
+    previous_balance = None
 
     import re
     import fitz
@@ -183,22 +184,22 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         neg = t.endswith("-")
         pos = t.endswith("+")
         t = t[:-1] if neg or pos else t
-        return -float(t.replace(",", "")) if neg else float(t.replace(",", ""))
+        v = float(t.replace(",", ""))
+        return -v if neg else v
 
     def norm_date(t: str) -> str:
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
     # ======================================================
-    # 1️⃣ EXTRACT OPENING BALANCE FROM SUMMARY (AUTHORITATIVE)
+    # 1️⃣ OPENING BALANCE — FROM DEPOSIT ACCOUNT SUMMARY
     # ======================================================
     opening_balance = None
+    summary_text = doc[0].get_text("text")
 
-    first_page_text = doc[0].get_text("text")
-
-    if "Deposit Account Summary" in first_page_text:
+    if "Deposit Account Summary" in summary_text:
         m = re.search(
             r"Beginning Balance.*?(\d{1,3}(?:,\d{3})*\.\d{2}-)",
-            first_page_text,
+            summary_text,
             re.DOTALL
         )
         if m:
@@ -209,7 +210,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     previous_balance = opening_balance
 
     # ======================================================
-    # 2️⃣ PARSE TRANSACTIONS (LAYOUT-BASED)
+    # 2️⃣ TRANSACTION PARSER (LAYOUT-BASED)
     # ======================================================
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
@@ -250,7 +251,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if not money_vals:
                 continue
 
-            # Rightmost money = balance
+            # Rightmost money value is the balance
             balance = parse_money(
                 max(money_vals, key=lambda m: m["x"])["text"]
             )
