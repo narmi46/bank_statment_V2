@@ -25,43 +25,55 @@ def _read_pdf_bytes(pdf_input):
 
 
 # ======================================================
-# 1️⃣ RHB ISLAMIC — TEXT BASED
+# RHB ISLAMIC — TEXT BASED (FIXED & SAFE)
 # ======================================================
 def _parse_rhb_islamic_text(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
 
+    # --- regex helpers ---
     balance_re = re.compile(r"(-?\d{1,3}(?:,\d{3})*\.\d{2})\s*$")
-    date_re = re.compile(r"(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
+    date_re = re.compile(r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
 
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+
+        # ======================================================
+        # 1️⃣ Extract header & safely detect YEAR
+        # ======================================================
         header = pdf.pages[0].extract_text() or ""
 
-        year = None
-        #y1 = re.search(r"\b(20\d{2})\b", header)
-        y1 = re.search(r"\d{1,2}\s*[A-Za-z]{3}\s*\d{2}", header)
-        y2 = re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b", header)
+        # 🔒 STRICT: only read year from "Statement Period"
+        period_match = re.search(
+            r"Statement Period.*?:\s*\d{1,2}\s+"
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})",
+            header,
+            re.IGNORECASE
+        )
 
-        if y1:
-            year = int(y1.group(1))
-        elif y2:
-            year = int("20" + y2.group(2))
-        else:
-            return []  # clean fail
+        if not period_match:
+            return []  # fail safely if year cannot be trusted
 
+        year = int("20" + period_match.group(2))  # e.g. 25 → 2025
+
+        # ======================================================
+        # 2️⃣ Parse transactions page by page
+        # ======================================================
         for page_index, page in enumerate(pdf.pages):
             text = page.extract_text()
             if not text:
                 continue
 
             for line in text.split("\n"):
-                bal = balance_re.search(line)
-                date = date_re.search(line)
-                if not bal or not date:
+
+                bal_match = balance_re.search(line)
+                date_match = date_re.search(line)
+
+                if not bal_match or not date_match:
                     continue
 
-                balance = float(bal.group(1).replace(",", ""))
+                balance = float(bal_match.group(1).replace(",", ""))
 
+                # --- skip B/F and C/F lines ---
                 if re.search(r"\bB/F\b|\bC/F\b", line):
                     previous_balance = balance
                     continue
@@ -70,16 +82,22 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
                     previous_balance = balance
                     continue
 
-                day, month = date.groups()
+                # --- build full date ---
+                day, month = date_match.groups()
                 date_iso = datetime.strptime(
-                    f"{day} {month} {year}", "%d %b %Y"
+                    f"{day} {month} {year}",
+                    "%d %b %Y"
                 ).strftime("%Y-%m-%d")
 
+                # --- compute debit / credit ---
                 delta = balance - previous_balance
-                debit = abs(delta) if delta < 0 else 0
-                credit = delta if delta > 0 else 0
+                debit = abs(delta) if delta < 0 else 0.0
+                credit = delta if delta > 0 else 0.0
 
-                desc = line.replace(bal.group(1), "").replace(date.group(0), "")
+                # --- clean description ---
+                desc = line
+                desc = desc.replace(bal_match.group(1), "")
+                desc = desc.replace(date_match.group(0), "")
                 desc = re.sub(r"\d{1,3}(?:,\d{3})*\.\d{2}", "", desc)
                 desc = re.sub(r"\s+", " ", desc).strip()
 
@@ -90,14 +108,13 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
                     "credit": round(credit, 2),
                     "balance": round(balance, 2),
                     "page": page_index + 1,
-                    "bank": "RHB Bank",
+                    "bank": "RHB Islamic Bank",
                     "source_file": source_filename
                 })
 
                 previous_balance = balance
 
     return transactions
-
 
 # ======================================================
 # 2️⃣ RHB CONVENTIONAL — TEXT BASED (NON-REFLEX)
