@@ -8,6 +8,9 @@ date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 
+# -------------------------------------------------
+# Detect column X ranges from header
+# -------------------------------------------------
 def detect_columns(page):
     debit_x = credit_x = balance_x = None
 
@@ -18,35 +21,46 @@ def detect_columns(page):
         elif t in ("credit", "kredit"):
             credit_x = (w["x0"] - 20, w["x1"] + 60)
         elif t in ("balance", "baki"):
-            balance_x = (w["x0"] - 20, w["x1"] + 80)
+            balance_x = (w["x0"] - 20, w["x1"] + 100)
 
     return debit_x, credit_x, balance_x
 
 
+# -------------------------------------------------
+# MAIN PARSER
+# -------------------------------------------------
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
+
     prev_balance = None
     current = None
     pending_desc = []
 
-    # ---- detect year from header ----
+    # -------------------------------------------------
+    # Detect YEAR from statement header
+    # -------------------------------------------------
     year = None
-    header = pdf.pages[0].extract_text() or ""
-    m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header)
+    header_text = pdf.pages[0].extract_text() or ""
+    m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
     if m:
         year = int("20" + m.group(1))
     else:
         year = datetime.date.today().year
 
-    # ---- detect column X positions ----
+    # -------------------------------------------------
+    # Detect column X positions
+    # -------------------------------------------------
     debit_x, credit_x, balance_x = detect_columns(pdf.pages[0])
 
+    # -------------------------------------------------
+    # Parse pages
+    # -------------------------------------------------
     for page_no, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # map line → words
+        # Map line → words
         line_words = {}
         for w in words:
             for line in lines:
@@ -55,16 +69,23 @@ def parse_transactions_rhb(pdf, source_file):
                     break
 
         for line in lines:
-            # skip headers
+
+            # ------------------------------
+            # Skip headers / footers
+            # ------------------------------
             if any(h in line for h in [
-                "ACCOUNT ACTIVITY", "Date", "Debit", "Credit",
-                "Balance", "Baki", "Statement", "Page No"
+                "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit",
+                "Credit", "Balance", "Baki", "Page No",
+                "Statement Period", "IMPORTANT NOTES",
+                "Member of PIDM", "Total Count"
             ]):
                 continue
 
             dm = date_re.match(line)
 
-            # ------------------ DATE LINE ------------------
+            # ==============================
+            # DATE LINE → new transaction
+            # ==============================
             if dm:
                 if current:
                     transactions.append(current)
@@ -72,11 +93,11 @@ def parse_transactions_rhb(pdf, source_file):
 
                 day, mon = dm.groups()
                 try:
-                    dt = datetime.datetime.strptime(
+                    tx_date = datetime.datetime.strptime(
                         f"{day}{mon}{year}", "%d%b%Y"
                     ).date().isoformat()
                 except:
-                    dt = f"{day} {mon} {year}"
+                    tx_date = f"{day} {mon} {year}"
 
                 debit = credit = 0.0
                 balance = None
@@ -93,12 +114,16 @@ def parse_transactions_rhb(pdf, source_file):
 
                 nums.sort(key=lambda x: x["x"])
 
+                # Rightmost number is ALWAYS balance
                 if nums:
                     balance = nums[-1]["val"]
                     txn_nums = nums[:-1]
                 else:
                     txn_nums = []
 
+                # ------------------------------
+                # Assign debit / credit by X-axis
+                # ------------------------------
                 for n in txn_nums:
                     x_mid = (n["x"] + n["x1"]) / 2
                     if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
@@ -106,14 +131,22 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # fallback using balance diff
-                if debit == 0 and credit == 0 and prev_balance is not None and balance is not None:
-                    diff = balance - prev_balance
+                # ------------------------------
+                # 🔒 FINAL AUTHORITY: BALANCE DIFF
+                # ------------------------------
+                if prev_balance is not None and balance is not None:
+                    diff = round(balance - prev_balance, 2)
+
                     if diff > 0:
                         credit = diff
+                        debit = 0.0
                     elif diff < 0:
                         debit = abs(diff)
+                        credit = 0.0
 
+                # ------------------------------
+                # Build description
+                # ------------------------------
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
@@ -124,17 +157,19 @@ def parse_transactions_rhb(pdf, source_file):
                     pending_desc = []
 
                 current = {
-                    "date": dt,
+                    "date": tx_date,
                     "description": " ".join(desc.split()),
                     "debit": round(debit, 2),
                     "credit": round(credit, 2),
-                    "balance": round(balance, 2) if balance else None,
+                    "balance": round(balance, 2) if balance is not None else None,
                     "page": page_no,
                     "bank": BANK_NAME,
                     "source_file": source_file
                 }
 
-            # ------------------ CONTINUATION ------------------
+            # ==============================
+            # CONTINUATION LINE
+            # ==============================
             else:
                 if current:
                     current["description"] += " " + line
