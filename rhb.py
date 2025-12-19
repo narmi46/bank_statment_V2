@@ -32,11 +32,12 @@ def parse_transactions_rhb(pdf_input, source_filename):
 
     # ---------------- HELPERS ----------------
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}-?$")
+    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
 
     def parse_money(t: str) -> float:
         neg = t.endswith("-")
-        t = t[:-1] if neg else t
+        pos = t.endswith("+")
+        t = t[:-1] if neg or pos else t
         v = float(t.replace(",", ""))
         return -v if neg else v
 
@@ -44,27 +45,39 @@ def parse_transactions_rhb(pdf_input, source_filename):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
     # ==========================================================
-    # STEP 1: EXTRACT OPENING BALANCE (PAGE 1 ONLY)
+    # STEP 1: OPENING BALANCE (X-AXIS SAME LINE EXTRACTION)
     # ==========================================================
     opening_balance = None
     first_page = doc[0]
     words = first_page.get_text("words")
 
-    for i, w in enumerate(words):
-        if "BEGINNING" in w[4].upper() and "BALANCE" in w[4].upper():
-            y_ref = w[1]
-            # find money just below
-            candidates = [
-                x for x in words
-                if x[1] > y_ref and MONEY_RE.match(x[4].strip())
+    rows = [{
+        "x": w[0],
+        "y": round(w[1], 1),
+        "text": w[4].strip()
+    } for w in words if w[4].strip()]
+
+    for r in rows:
+        t = r["text"].upper()
+        if "BEGINNING" in t and "BALANCE" in t:
+            y_ref = r["y"]
+            x_ref = r["x"]
+
+            same_line = [
+                w for w in rows
+                if abs(w["y"] - y_ref) <= 1.5
+                and w["x"] > x_ref
+                and MONEY_RE.match(w["text"])
             ]
-            if candidates:
-                opening_balance = parse_money(candidates[0][4])
+
+            if same_line:
+                same_line.sort(key=lambda w: w["x"])
+                opening_balance = parse_money(same_line[-1]["text"])
             break
 
     # ---------------- MAIN PARSER ----------------
     transactions = []
-    previous_balance = opening_balance  # ✅ THIS FIXES FIRST ROW
+    previous_balance = opening_balance  # ✅ critical
 
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
@@ -100,14 +113,16 @@ def parse_transactions_rhb(pdf_input, source_filename):
                 if MONEY_RE.match(w["text"]):
                     money.append(w)
                 else:
-                    desc.append(w["text"])
+                    if not w["text"].isdigit():
+                        desc.append(w["text"])
 
-            if len(money) < 1:
+            if not money:
                 continue
 
-            balance = parse_money(money[-1]["text"])
-            debit = credit = 0.0
+            # rightmost money = balance
+            balance = parse_money(max(money, key=lambda m: m["x"])["text"])
 
+            debit = credit = 0.0
             if previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
                 if delta > 0:
