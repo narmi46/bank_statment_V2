@@ -29,10 +29,24 @@ def is_summary_row(text: str) -> bool:
 # =================================================
 def detect_year(pdf):
     text = pdf.pages[0].extract_text() or ""
-    m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", text)
-    if not m:
-        raise ValueError("❌ Statement year not detected – aborting parse")
-    return int("20" + m.group(1))
+
+    # 1️⃣ Prefer full year (2024)
+    m = re.search(r"\b(20\d{2})\b", text)
+    if m:
+        return int(m.group(1))
+
+    # 2️⃣ Fallback: short year (24)
+    m = re.search(r"\b(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})\b", text)
+    if m:
+        return int("20" + m.group(2))
+
+    # 3️⃣ Fallback: numeric date (01/03/2024)
+    m = re.search(r"\b\d{1,2}/\d{1,2}/(20\d{2})\b", text)
+    if m:
+        return int(m.group(1))
+
+    # ❌ Hard fail only if everything fails
+    raise ValueError("❌ Statement year not detected – unsupported statement format")
 
 # =================================================
 # COLUMN DETECTORS
