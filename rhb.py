@@ -165,45 +165,59 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX / CASH MANAGEMENT — FINAL & CORRECT
+# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
-    previous_balance = None
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
     MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
 
-    def parse_money(t: str) -> float:
+    def parse_money(t):
         neg = t.endswith("-")
         pos = t.endswith("+")
         t = t[:-1] if neg or pos else t
-        v = float(t.replace(",", ""))
-        return -v if neg else v
+        try:
+            v = float(t.replace(",", ""))
+            return -v if neg else v
+        except ValueError:
+            return 0.0
 
-    def norm_date(t: str) -> str:
+    def norm_date(t):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    # ---------- Opening Balance from Deposit Account Summary ----------
+    # -------- Opening Balance --------
     opening_balance = None
-    text = doc[0].get_text("text")
+    first_page = doc[0]
+    words = first_page.get_text("words")
 
-    if "Deposit Account Summary" in text:
-        m = re.search(
-            r"Beginning Balance.*?(\d{1,3}(?:,\d{3})*\.\d{2}-)",
-            text,
-            re.DOTALL
-        )
-        if m:
-            opening_balance = -float(
-                m.group(1).replace(",", "").replace("-", "")
-            )
+    rows = [{
+        "x": w[0],
+        "y": round(w[1], 1),
+        "text": w[4].strip()
+    } for w in words if w[4].strip()]
+
+    for r in rows:
+        text = r["text"].upper()
+        if "BEGINNING" in text and "BALANCE" in text:
+            y_ref = r["y"]
+            x_ref = r["x"]
+            same_line_money = [
+                w for w in rows
+                if abs(w["y"] - y_ref) <= 1.5
+                and w["x"] > x_ref
+                and MONEY_RE.match(w["text"])
+            ]
+            if same_line_money:
+                same_line_money.sort(key=lambda w: w["x"])
+                opening_balance = parse_money(same_line_money[-1]["text"])
+            break
 
     previous_balance = opening_balance
 
-    # ---------- Transactions ----------
+    # -------- Transactions --------
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
         rows = [{
@@ -219,12 +233,12 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if not DATE_RE.match(r["text"]):
                 continue
 
-            y = r["y"]
-            if y in used_y:
+            y_key = r["y"]
+            if y_key in used_y:
                 continue
 
             date_iso = norm_date(r["text"])
-            line = [w for w in rows if abs(w["y"] - y) <= 1.5]
+            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
             description = []
@@ -255,7 +269,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
             transactions.append({
                 "date": date_iso,
-                "description": " ".join(description)[:200].strip(),
+                "description": " ".join(description)[:200],
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
                 "balance": round(balance, 2),
@@ -265,14 +279,14 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             })
 
             previous_balance = balance
-            used_y.add(y)
+            used_y.add(y_key)
 
     doc.close()
     return transactions
 
 
 # ======================================================
-# 🚦 FINAL ENTRYPOINT (IMPORT SAFE)
+# 🚦 FINAL ENTRYPOINT — FALLBACK LOGIC
 # ======================================================
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
