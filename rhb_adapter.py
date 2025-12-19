@@ -3,145 +3,187 @@ import datetime
 
 BANK_NAME = "RHB Bank"
 
-# Matches currency formatted numbers (e.g., 1,000.00) 
+# ---------------------------
+# Regex
+# ---------------------------
+date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
-    "B/F BALANCE", "C/F BALANCE", "BALANCE B/F", "BALANCE C/F",
-    "ACCOUNT SUMMARY", "RINGKASAN AKAUN", "DEPOSIT ACCOUNT SUMMARY",
-    "IMPORTANT NOTES", "MEMBER OF PIDM", "ALL INFORMATION AND BALANCES",
+    "B/F BALANCE",
+    "C/F BALANCE",
+    "ACCOUNT SUMMARY",
+    "RINGKASAN AKAUN",
+    "IMPORTANT NOTES",
+    "MEMBER OF PIDM",
+    "TOTAL COUNT",
 ]
 
+
+# ---------------------------
+# Helpers
+# ---------------------------
 def is_summary_row(text: str) -> bool:
-    text = text.upper()
-    return any(k in text for k in SUMMARY_KEYWORDS)
+    t = text.upper()
+    return any(k in t for k in SUMMARY_KEYWORDS)
+
+
+def detect_year_from_coords(pdf):
+    """
+    Detect year from top header words using coordinates,
+    not full-text regex.
+    """
+    page = pdf.pages[0]
+    words = page.extract_words()
+
+    header_words = [w["text"] for w in words if w["top"] < 120]
+    header_text = " ".join(header_words)
+
+    m = re.search(r"\b[A-Za-z]{3}\s+(\d{2})\b", header_text)
+    if m:
+        return int("20" + m.group(1))
+
+    return datetime.date.today().year
+
 
 def detect_columns(page):
     """
-    Sets coordinate lanes based on standard RHB layouts.
+    Detect Debit / Credit / Balance X ranges per page
     """
-    # Standard RHB coordinates (wide lanes for stability)
-    date_lane = (30, 100) 
-    debit_lane = (320, 415)
-    credit_lane = (420, 510)
-    balance_lane = (515, 615)
-    
-    words = page.extract_words()
-    for w in words:
+    debit_x = credit_x = balance_x = None
+
+    for w in page.extract_words():
         t = w["text"].lower()
-        if t in ("date", "tarikh"):
-            date_lane = (w["x0"] - 15, w["x1"] + 30)
-        elif t in ("debit", "debil"): # 'debil' handles Islamic OCR 
-            debit_lane = (w["x0"] - 25, w["x1"] + 55)
+        if t == "debit":
+            debit_x = (w["x0"] - 20, w["x1"] + 60)
         elif t in ("credit", "kredit"):
-            credit_lane = (w["x0"] - 25, w["x1"] + 55)
+            credit_x = (w["x0"] - 20, w["x1"] + 60)
         elif t in ("balance", "baki"):
-            balance_lane = (w["x0"] - 25, w["x1"] + 95)
+            balance_x = (w["x0"] - 20, w["x1"] + 100)
 
-    return date_lane, debit_lane, credit_lane, balance_lane
+    return debit_x, credit_x, balance_x
 
+
+def group_words_by_line(words, y_tol=3):
+    """
+    Group words into visual lines using Y coordinates
+    """
+    lines = []
+    for w in sorted(words, key=lambda x: -x["top"]):
+        placed = False
+        for line in lines:
+            if abs(line[0]["top"] - w["top"]) < y_tol:
+                line.append(w)
+                placed = True
+                break
+        if not placed:
+            lines.append([w])
+    return lines
+
+
+# ---------------------------
+# MAIN PARSER
+# ---------------------------
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
     prev_balance = None
     current = None
 
-    # Detect year from the Statement Period header [cite: 6, 130]
-    header_text = pdf.pages[0].extract_text() or ""
-    m = re.search(r"([A-Za-z]{3})\s+(\d{2})[\s\-–]", header_text)
-    year = int("20" + m.group(2)) if m else datetime.date.today().year
-
-    # Set column lanes using Page 1
-    date_lane, debit_lane, credit_lane, balance_lane = detect_columns(pdf.pages[0])
+    year = detect_year_from_coords(pdf)
 
     for page_no, page in enumerate(pdf.pages, start=1):
+        debit_x, credit_x, balance_x = detect_columns(page)
+
         words = page.extract_words()
-        
-        # Group words by vertical position
-        lines_data = {}
-        for w in words:
-            y = round(w["top"])
-            lines_data.setdefault(y, []).append(w)
+        visual_lines = group_words_by_line(words)
 
-        for y in sorted(lines_data.keys()):
-            line_words = sorted(lines_data[y], key=lambda x: x["x0"])
-            line_text = " ".join([w["text"] for w in line_words])
+        for line_words in visual_lines:
+            line_words.sort(key=lambda w: w["x0"])
+            line_text = " ".join(w["text"] for w in line_words)
 
-            # Skip summary rows and table headers 
-            if is_summary_row(line_text) or any(x in line_text for x in ["Page No", "Statement Period", "Tarikh", "Diskripsi"]):
+            # Ignore summaries and headers
+            if is_summary_row(line_text):
                 continue
 
-            # 1. Coordinate-Based Date Search
-            date_word = None
+            if any(h in line_text for h in [
+                "ACCOUNT ACTIVITY", "Date", "Tarikh",
+                "Debit", "Credit", "Balance", "Page No"
+            ]):
+                continue
+
+            dm = date_re.match(line_text)
+            if not dm:
+                continue  # 🔒 ignore continuation lines entirely
+
+            # Save previous transaction
+            if current:
+                transactions.append(current)
+                prev_balance = current["balance"]
+
+            day, mon = dm.groups()
+
+            try:
+                tx_date = datetime.datetime.strptime(
+                    f"{day}{mon}{year}", "%d%b%Y"
+                ).date().isoformat()
+            except Exception:
+                tx_date = f"{day} {mon} {year}"
+
+            # Extract numeric values
+            nums = []
             for w in line_words:
-                mid_x = (w["x0"] + w["x1"]) / 2
-                # Look for the day (e.g., '07' or '1') in the left lane 
-                if date_lane[0] <= mid_x <= date_lane[1]:
-                    if w["text"].isdigit() and 1 <= len(w["text"]) <= 2:
-                        date_word = w
-                        break
-            
-            if date_word:
-                if current:
-                    transactions.append(current)
-                    prev_balance = current["balance"]
+                txt = w["text"].replace(",", "")
+                if num_re.fullmatch(txt):
+                    nums.append({
+                        "val": float(txt),
+                        "x_mid": (w["x0"] + w["x1"]) / 2
+                    })
 
-                day = date_word["text"]
-                # The month word is immediately following the day
-                idx = line_words.index(date_word)
-                mon = line_words[idx+1]["text"] if idx+1 < len(line_words) else "Jan"
+            debit = credit = 0.0
+            balance = None
 
-                try:
-                    tx_date = datetime.datetime.strptime(f"{day}{mon[:3]}{year}", "%d%b%Y").date().isoformat()
-                except:
-                    tx_date = f"{day} {mon} {year}"
-
-                # 2. Coordinate-Based Amount Search
-                nums = []
-                for w in line_words:
-                    clean_val = w["text"].replace(",", "")
-                    if num_re.fullmatch(clean_val):
-                        nums.append({"val": float(clean_val), "mid": (w["x0"] + w["x1"]) / 2})
-                
-                nums.sort(key=lambda x: x["mid"])
-                
-                # RHB rightmost column is always balance [cite: 22, 38, 54]
-                balance = nums[-1]["val"] if nums else None
-                debit = credit = 0.0
-                
-                for n in nums[:-1]:
-                    if debit_lane[0] <= n["mid"] <= debit_lane[1]:
-                        debit = n["val"]
-                    elif credit_lane[0] <= n["mid"] <= credit_lane[1]:
-                        credit = n["val"]
-
-                # 3. Arithmetic Safety Net
-                if prev_balance is not None and balance is not None:
-                    diff = round(balance - prev_balance, 2)
-                    if diff > 0: 
-                        credit, debit = diff, 0.0
-                    elif diff < 0: 
-                        debit, credit = abs(diff), 0.0
-
-                # 4. Strictly Extract Line 1 Description
-                # Filter out the date words and the transaction amounts
-                desc_parts = [w["text"] for w in line_words if w != date_word and w["text"] != mon]
-                final_desc = " ".join([p for p in desc_parts if not num_re.fullmatch(p.replace(",", ""))])
-
-                current = {
-                    "date": tx_date,
-                    "description": final_desc.strip(),
-                    "debit": round(debit, 2),
-                    "credit": round(credit, 2),
-                    "balance": round(balance, 2) if balance is not None else None,
-                    "page": page_no,
-                    "bank": BANK_NAME,
-                    "source_file": source_file
-                }
+            if nums:
+                balance = nums[-1]["val"]
+                txn_nums = nums[:-1]
             else:
-                # No date in the left lane; this is a continuation line [cite: 38, 166]
-                continue
+                txn_nums = []
 
-    if current:
-        transactions.append(current)
+            for n in txn_nums:
+                if debit_x and debit_x[0] <= n["x_mid"] <= debit_x[1]:
+                    debit = n["val"]
+                elif credit_x and credit_x[0] <= n["x_mid"] <= credit_x[1]:
+                    credit = n["val"]
+
+            # 🔒 Balance difference is final authority (except B/F, C/F)
+            if prev_balance is not None and balance is not None:
+                diff = round(balance - prev_balance, 2)
+                if diff > 0:
+                    credit = diff
+                    debit = 0.0
+                elif diff < 0:
+                    debit = abs(diff)
+                    credit = 0.0
+
+            # Clean description (FIRST LINE ONLY)
+            desc = line_text
+            desc = re.sub(num_re, "", desc)
+            desc = desc.replace(day, "").replace(mon, "").strip()
+            desc = " ".join(desc.split())
+
+            current = {
+                "date": tx_date,
+                "description": desc,
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2) if balance is not None else None,
+                "page": page_no,
+                "bank": BANK_NAME,
+                "source_file": source_file
+            }
+
+        if current:
+            transactions.append(current)
+            prev_balance = current["balance"]
+            current = None
 
     return transactions
