@@ -165,7 +165,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED
+# 3️⃣ RHB REFLEX / CASH MANAGEMENT — FIXED
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
@@ -179,19 +179,20 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         neg = t.endswith("-")
         pos = t.endswith("+")
         t = t[:-1] if neg or pos else t
-        try:
-            v = float(t.replace(",", ""))
-            return -v if neg else v
-        except ValueError:
-            return 0.0
+        v = float(t.replace(",", ""))
+        return -v if neg else v
 
     def norm_date(t):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    # -------- Opening Balance --------
-    opening_balance = None
-    first_page = doc[0]
-    words = first_page.get_text("words")
+    # ======================================================
+    # 1️⃣ DERIVE OPENING BALANCE FROM FIRST TRANSACTION
+    # ======================================================
+    previous_balance = None
+    first_tx_balance = None
+
+    page0 = doc[0]
+    words = page0.get_text("words")
 
     rows = [{
         "x": w[0],
@@ -199,25 +200,22 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         "text": w[4].strip()
     } for w in words if w[4].strip()]
 
+    rows.sort(key=lambda r: (r["y"], r["x"]))
+
     for r in rows:
-        text = r["text"].upper()
-        if "BEGINNING" in text and "BALANCE" in text:
-            y_ref = r["y"]
-            x_ref = r["x"]
-            same_line_money = [
-                w for w in rows
-                if abs(w["y"] - y_ref) <= 1.5
-                and w["x"] > x_ref
-                and MONEY_RE.match(w["text"])
-            ]
-            if same_line_money:
-                same_line_money.sort(key=lambda w: w["x"])
-                opening_balance = parse_money(same_line_money[-1]["text"])
-            break
+        if DATE_RE.match(r["text"]):
+            y_key = r["y"]
+            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+            money_vals = [w for w in line if MONEY_RE.match(w["text"])]
+            if money_vals:
+                first_tx_balance = parse_money(
+                    max(money_vals, key=lambda m: m["x"])["text"]
+                )
+                break
 
-    previous_balance = opening_balance
-
-    # -------- Transactions --------
+    # ======================================================
+    # 2️⃣ TRANSACTIONS
+    # ======================================================
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
         rows = [{
@@ -259,13 +257,12 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 max(money_vals, key=lambda m: m["x"])["text"]
             )
 
-            debit = credit = 0.0
-            if previous_balance is not None:
-                delta = round(balance - previous_balance, 2)
-                if delta > 0:
-                    credit = delta
-                elif delta < 0:
-                    debit = abs(delta)
+            if previous_balance is None and first_tx_balance is not None:
+                previous_balance = first_tx_balance
+
+            delta = round(balance - previous_balance, 2)
+            debit = abs(delta) if delta < 0 else 0.0
+            credit = delta if delta > 0 else 0.0
 
             transactions.append({
                 "date": date_iso,
@@ -286,7 +283,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 🚦 FINAL ENTRYPOINT — FALLBACK LOGIC
+# 🚦 FINAL ENTRYPOINT
 # ======================================================
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
