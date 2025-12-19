@@ -3,10 +3,10 @@ import datetime
 
 BANK_NAME = "RHB Bank"
 
-# ---------------------------
+# -------------------------------------------------
 # Regex
-# ---------------------------
-date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
+# -------------------------------------------------
+date_re = re.compile(r"^(\d{2})\s*([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
@@ -20,18 +20,18 @@ SUMMARY_KEYWORDS = [
 ]
 
 
-# ---------------------------
+# -------------------------------------------------
 # Helpers
-# ---------------------------
+# -------------------------------------------------
 def is_summary_row(text: str) -> bool:
-    t = text.upper()
-    return any(k in t for k in SUMMARY_KEYWORDS)
+    text = text.upper()
+    return any(k in text for k in SUMMARY_KEYWORDS)
 
 
 def detect_year_from_coords(pdf):
     """
-    Detect year from top header words using coordinates,
-    not full-text regex.
+    Detect year using top header coordinates.
+    Works even when text has no spaces: 7Mar24–31Mar24
     """
     page = pdf.pages[0]
     words = page.extract_words()
@@ -39,7 +39,10 @@ def detect_year_from_coords(pdf):
     header_words = [w["text"] for w in words if w["top"] < 120]
     header_text = " ".join(header_words)
 
-    m = re.search(r"\b[A-Za-z]{3}\s+(\d{2})\b", header_text)
+    print("DEBUG HEADER:", header_text)
+
+    # Match Mar24, Apr24, etc (with or without spaces)
+    m = re.search(r"[A-Za-z]{3}(\d{2})", header_text)
     if m:
         return int("20" + m.group(1))
 
@@ -47,9 +50,6 @@ def detect_year_from_coords(pdf):
 
 
 def detect_columns(page):
-    """
-    Detect Debit / Credit / Balance X ranges per page
-    """
     debit_x = credit_x = balance_x = None
 
     for w in page.extract_words():
@@ -64,15 +64,15 @@ def detect_columns(page):
     return debit_x, credit_x, balance_x
 
 
-def group_words_by_line(words, y_tol=3):
+def group_words_by_line(words, y_tol=4):
     """
-    Group words into visual lines using Y coordinates
+    Group words into visual lines using Y coordinate
     """
     lines = []
     for w in sorted(words, key=lambda x: -x["top"]):
         placed = False
         for line in lines:
-            if abs(line[0]["top"] - w["top"]) < y_tol:
+            if abs(line[0]["top"] - w["top"]) <= y_tol:
                 line.append(w)
                 placed = True
                 break
@@ -81,15 +81,16 @@ def group_words_by_line(words, y_tol=3):
     return lines
 
 
-# ---------------------------
+# -------------------------------------------------
 # MAIN PARSER
-# ---------------------------
+# -------------------------------------------------
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
     prev_balance = None
     current = None
 
     year = detect_year_from_coords(pdf)
+    print("DETECTED YEAR:", year)
 
     for page_no, page in enumerate(pdf.pages, start=1):
         debit_x, credit_x, balance_x = detect_columns(page)
@@ -101,19 +102,19 @@ def parse_transactions_rhb(pdf, source_file):
             line_words.sort(key=lambda w: w["x0"])
             line_text = " ".join(w["text"] for w in line_words)
 
-            # Ignore summaries and headers
+            # Skip headers & summaries
             if is_summary_row(line_text):
                 continue
 
             if any(h in line_text for h in [
                 "ACCOUNT ACTIVITY", "Date", "Tarikh",
-                "Debit", "Credit", "Balance", "Page No"
+                "Debit", "Credit", "Balance", "PageNo"
             ]):
                 continue
 
             dm = date_re.match(line_text)
             if not dm:
-                continue  # 🔒 ignore continuation lines entirely
+                continue  # 🔒 ignore continuation lines
 
             # Save previous transaction
             if current:
@@ -129,7 +130,7 @@ def parse_transactions_rhb(pdf, source_file):
             except Exception:
                 tx_date = f"{day} {mon} {year}"
 
-            # Extract numeric values
+            # Extract numeric values with X positions
             nums = []
             for w in line_words:
                 txt = w["text"].replace(",", "")
@@ -148,13 +149,14 @@ def parse_transactions_rhb(pdf, source_file):
             else:
                 txn_nums = []
 
+            # Assign debit / credit by X-axis
             for n in txn_nums:
                 if debit_x and debit_x[0] <= n["x_mid"] <= debit_x[1]:
                     debit = n["val"]
                 elif credit_x and credit_x[0] <= n["x_mid"] <= credit_x[1]:
                     credit = n["val"]
 
-            # 🔒 Balance difference is final authority (except B/F, C/F)
+            # 🔒 Balance difference is final authority
             if prev_balance is not None and balance is not None:
                 diff = round(balance - prev_balance, 2)
                 if diff > 0:
@@ -164,7 +166,7 @@ def parse_transactions_rhb(pdf, source_file):
                     debit = abs(diff)
                     credit = 0.0
 
-            # Clean description (FIRST LINE ONLY)
+            # FIRST LINE DESCRIPTION ONLY
             desc = line_text
             desc = re.sub(num_re, "", desc)
             desc = desc.replace(day, "").replace(mon, "").strip()
@@ -186,4 +188,5 @@ def parse_transactions_rhb(pdf, source_file):
             prev_balance = current["balance"]
             current = None
 
+    print("TOTAL TRANSACTIONS:", len(transactions))
     return transactions
