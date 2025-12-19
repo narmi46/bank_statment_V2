@@ -1,134 +1,303 @@
 import re
-import datetime
+import fitz
+import pdfplumber
+from datetime import datetime
+from io import BytesIO
 
-def parse_transactions_rhb(pdf, source_file):
+
+# ======================================================
+# Helper: read PDF bytes safely
+# ======================================================
+def _read_pdf_bytes(pdf_input):
+    if isinstance(pdf_input, (bytes, bytearray)):
+        return bytes(pdf_input)
+
+    if hasattr(pdf_input, "stream"):  # Streamlit UploadedFile
+        pdf_input.stream.seek(0)
+        return pdf_input.stream.read()
+
+    if hasattr(pdf_input, "read"):
+        pdf_input.seek(0)
+        return pdf_input.read()
+
+    with open(pdf_input, "rb") as f:
+        return f.read()
+
+
+# ======================================================
+# 1️⃣ RHB ISLAMIC — TEXT BASED
+# ======================================================
+def _parse_rhb_islamic_text(pdf_bytes, source_filename):
     transactions = []
-    bank_name = "RHB Bank"
+    previous_balance = None
 
-    # Match both: "07Mar" and "07 Mar"
-    date_re = re.compile(r'^(\d{2})\s*([A-Za-z]{3})\b')
-    num_re = re.compile(r'\d[\d,]*\.\d{2}')
+    balance_re = re.compile(r"(-?\d{1,3}(?:,\d{3})*\.\d{2})\s*$")
+    date_re = re.compile(r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
 
-    # -------------------------------------------------
-    # 1️⃣ Detect YEAR from statement header
-    # -------------------------------------------------
-    year = None
-    for page in pdf.pages[:1]:
-        text = page.extract_text() or ""
-        m = re.search(r'(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]\s*(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})', text)
-        if m:
-            year = int("20" + m.group(2))
-    if not year:
-        year = datetime.date.today().year
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        header = pdf.pages[0].extract_text() or ""
 
-    prev_balance = None
-    current = None
-    pending_desc = []
+        period_match = re.search(
+            r"Statement Period.*?:\s*\d{1,2}\s+"
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})",
+            header,
+            re.IGNORECASE
+        )
 
-    # -------------------------------------------------
-    # 2️⃣ Main parsing
-    # -------------------------------------------------
-    for page_idx, page in enumerate(pdf.pages, start=1):
-        text = page.extract_text() or ""
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not period_match:
+            return []
 
-        for line in lines:
-            # Skip headers / noise
-            if any(h in line for h in [
-                "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit",
-                "Balance", "ORDINARY CURRENT", "QARD CURRENT",
-                "Total Count", "IMPORTANT NOTES"
-            ]):
+        year = int("20" + period_match.group(2))
+
+        for page_index, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
                 continue
 
-            # ------------------------------
-            # DATE LINE (new transaction)
-            # ------------------------------
-            dm = date_re.match(line)
-            if dm:
-                # Flush previous transaction
-                if current:
-                    transactions.append(current)
-                    prev_balance = current.get("balance", prev_balance)
-
-                day, mon = dm.group(1), dm.group(2)
-                try:
-                    dt = datetime.datetime.strptime(f"{day}{mon}{year}", "%d%b%Y").date()
-                    date_out = dt.isoformat()
-                except Exception:
-                    date_out = f"{day} {mon} {year}"
-
-                # Handle B/F and C/F balance rows
-                if "B/F BALANCE" in line or "C/F BALANCE" in line:
-                    amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
-                    if amts:
-                        prev_balance = amts[-1]
-                    current = None
-                    pending_desc = []
+            for line in text.split("\n"):
+                bal_match = balance_re.search(line)
+                date_match = date_re.search(line)
+                if not bal_match or not date_match:
                     continue
 
-                # Extract amounts
-                amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
+                balance = float(bal_match.group(1).replace(",", ""))
 
-                debit = credit = 0.0
-                balance = None
+                if re.search(r"\bB/F\b|\bC/F\b", line):
+                    previous_balance = balance
+                    continue
 
-                if len(amts) == 3:
-                    debit, credit, balance = amts
-                elif len(amts) == 2:
-                    amt, balance = amts
-                    if prev_balance is not None:
-                        if abs(prev_balance + amt - balance) < 0.02:
-                            credit = amt
-                        elif abs(prev_balance - amt - balance) < 0.02:
-                            debit = amt
-                        else:
-                            debit = amt
-                    else:
-                        debit = amt
-                elif len(amts) == 1:
-                    balance = amts[0]
+                if previous_balance is None:
+                    previous_balance = balance
+                    continue
 
-                # Build description
+                day, month = date_match.groups()
+                date_iso = datetime.strptime(
+                    f"{day} {month} {year}", "%d %b %Y"
+                ).strftime("%Y-%m-%d")
+
+                delta = balance - previous_balance
+                debit = abs(delta) if delta < 0 else 0.0
+                credit = delta if delta > 0 else 0.0
+
                 desc = line
-                for a in num_re.findall(desc):
-                    desc = desc.replace(a, "")
-                desc = desc.replace(day, "").replace(mon, "").strip()
+                desc = desc.replace(bal_match.group(1), "")
+                desc = desc.replace(date_match.group(0), "")
+                desc = re.sub(r"\d{1,3}(?:,\d{3})*\.\d{2}", "", desc)
+                desc = re.sub(r"\s+", " ", desc).strip()
 
-                # Prepend buffered description (lines BEFORE date)
-                if pending_desc:
-                    desc = " ".join(pending_desc) + " " + desc
-                    pending_desc = []
+                transactions.append({
+                    "date": date_iso,
+                    "description": desc,
+                    "debit": round(debit, 2),
+                    "credit": round(credit, 2),
+                    "balance": round(balance, 2),
+                    "page": page_index + 1,
+                    "bank": "RHB Islamic Bank",
+                    "source_file": source_filename
+                })
 
-                current = {
-                    "date": date_out,
-                    "description": " ".join(desc.split()),
-                    "debit": debit,
-                    "credit": credit,
-                    "balance": balance,
-                    "page": page_idx,
-                    "bank": bank_name,
-                    "source_file": source_file
-                }
+                previous_balance = balance
 
-            # ------------------------------
-            # NON-DATE LINE
-            # ------------------------------
-            else:
-                # Fee row (SC DR 0.50) → merge into next tx
-                if "SC DR" in line and num_re.search(line):
+    return transactions
+
+
+# ======================================================
+# 2️⃣ RHB CONVENTIONAL — TEXT BASED
+# ======================================================
+def _parse_rhb_conventional_text(pdf_bytes, source_filename):
+    transactions = []
+    previous_balance = None
+
+    balance_re = re.compile(r"(-?\d{1,3}(?:,\d{3})*\.\d{2})\s*$")
+    date_re = re.compile(r"(\d{2})(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)")
+
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        header = pdf.pages[0].extract_text() or ""
+        ym = re.search(r"[A-Za-z]{3}(\d{2})", header)
+        if not ym:
+            return []
+
+        year = int("20" + ym.group(1))
+
+        for page_index, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            for line in text.split("\n"):
+                bal = balance_re.search(line)
+                date = date_re.search(line)
+                if not bal or not date:
                     continue
 
-                if current:
-                    current["description"] = " ".join((current["description"] + " " + line).split())
-                else:
-                    # Description BEFORE date (Islamic format)
-                    pending_desc.append(line)
+                balance = float(bal.group(1).replace(",", ""))
 
-        if current:
-            transactions.append(current)
-            prev_balance = current.get("balance", prev_balance)
-            current = None
+                if previous_balance is None:
+                    previous_balance = balance
+                    continue
 
-    
+                day, month = date.groups()
+                date_iso = datetime.strptime(
+                    f"{day}{month}{year}", "%d%b%Y"
+                ).strftime("%Y-%m-%d")
+
+                delta = balance - previous_balance
+                debit = abs(delta) if delta < 0 else 0.0
+                credit = delta if delta > 0 else 0.0
+
+                desc = line.replace(bal.group(1), "").replace(date.group(0), "")
+                desc = re.sub(r"\s+", " ", desc).strip()
+
+                transactions.append({
+                    "date": date_iso,
+                    "description": desc,
+                    "debit": round(debit, 2),
+                    "credit": round(credit, 2),
+                    "balance": round(balance, 2),
+                    "page": page_index + 1,
+                    "bank": "RHB Bank",
+                    "source_file": source_filename
+                })
+
+                previous_balance = balance
+
     return transactions
+
+
+# ======================================================
+# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED
+# ======================================================
+def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
+    transactions = []
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
+
+    def parse_money(t):
+        neg = t.endswith("-")
+        pos = t.endswith("+")
+        t = t[:-1] if neg or pos else t
+        try:
+            v = float(t.replace(",", ""))
+            return -v if neg else v
+        except ValueError:
+            return 0.0
+
+    def norm_date(t):
+        return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
+
+    # -------- Opening Balance --------
+    opening_balance = None
+    first_page = doc[0]
+    words = first_page.get_text("words")
+
+    rows = [{
+        "x": w[0],
+        "y": round(w[1], 1),
+        "text": w[4].strip()
+    } for w in words if w[4].strip()]
+
+    for r in rows:
+        text = r["text"].upper()
+        if "BEGINNING" in text and "BALANCE" in text:
+            y_ref = r["y"]
+            x_ref = r["x"]
+            same_line_money = [
+                w for w in rows
+                if abs(w["y"] - y_ref) <= 1.5
+                and w["x"] > x_ref
+                and MONEY_RE.match(w["text"])
+            ]
+            if same_line_money:
+                same_line_money.sort(key=lambda w: w["x"])
+                opening_balance = parse_money(same_line_money[-1]["text"])
+            break
+
+    previous_balance = opening_balance
+
+    # -------- Transactions --------
+    for page_index, page in enumerate(doc):
+        words = page.get_text("words")
+        rows = [{
+            "x": w[0],
+            "y": round(w[1], 1),
+            "text": w[4].strip()
+        } for w in words if w[4].strip()]
+
+        rows.sort(key=lambda r: (r["y"], r["x"]))
+        used_y = set()
+
+        for r in rows:
+            if not DATE_RE.match(r["text"]):
+                continue
+
+            y_key = r["y"]
+            if y_key in used_y:
+                continue
+
+            date_iso = norm_date(r["text"])
+            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+            line.sort(key=lambda w: w["x"])
+
+            description = []
+            money_vals = []
+
+            for w in line:
+                if w["text"] == r["text"]:
+                    continue
+                if MONEY_RE.match(w["text"]):
+                    money_vals.append(w)
+                elif not w["text"].isdigit():
+                    description.append(w["text"])
+
+            if not money_vals:
+                continue
+
+            balance = parse_money(
+                max(money_vals, key=lambda m: m["x"])["text"]
+            )
+
+            debit = credit = 0.0
+            if previous_balance is not None:
+                delta = round(balance - previous_balance, 2)
+                if delta > 0:
+                    credit = delta
+                elif delta < 0:
+                    debit = abs(delta)
+
+            transactions.append({
+                "date": date_iso,
+                "description": " ".join(description)[:200],
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2),
+                "page": page_index + 1,
+                "bank": "RHB Bank",
+                "source_file": source_filename
+            })
+
+            previous_balance = balance
+            used_y.add(y_key)
+
+    doc.close()
+    return transactions
+
+
+# ======================================================
+# 🚦 FINAL ENTRYPOINT — FALLBACK LOGIC
+# ======================================================
+def parse_transactions_rhb(pdf_input, source_filename):
+    pdf_bytes = _read_pdf_bytes(pdf_input)
+
+    for parser in (
+        _parse_rhb_islamic_text,
+        _parse_rhb_conventional_text,
+        _parse_rhb_reflex_layout,
+    ):
+        tx = parser(pdf_bytes, source_filename)
+        if tx:
+            return tx
+
+    return []
