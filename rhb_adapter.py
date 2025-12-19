@@ -1,136 +1,133 @@
 import re
 import datetime
 
-
-# ============================================================
-# MAIN PARSER — MATCHES app.py SIGNATURE
-# ============================================================
-
 def parse_transactions_rhb(pdf, source_file):
-    """
-    pdf          : pdfplumber.open(...) object (already opened by app.py)
-    source_file  : filename string
-    """
-
     transactions = []
     bank_name = "RHB Bank"
 
+    # Match both: "07Mar" and "07 Mar"
     date_re = re.compile(r'^(\d{2})\s*([A-Za-z]{3})\b')
-    amount_re = re.compile(r'\d[\d,]*\.\d{2}')
+    num_re = re.compile(r'\d[\d,]*\.\d{2}')
 
-    # ------------------------------------------------------------
-    # Detect year from statement header (best effort)
-    # ------------------------------------------------------------
-    year = datetime.date.today().year
-    header_text = pdf.pages[0].extract_text() or ""
-    m = re.search(
-        r'Statement Period.*?(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})',
-        header_text,
-        re.S
-    )
-    if m:
-        year = int("20" + m.group(2))
+    # -------------------------------------------------
+    # 1️⃣ Detect YEAR from statement header
+    # -------------------------------------------------
+    year = None
+    for page in pdf.pages[:1]:
+        text = page.extract_text() or ""
+        m = re.search(r'(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]\s*(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})', text)
+        if m:
+            year = int("20" + m.group(2))
+    if not year:
+        year = datetime.date.today().year
 
-    pending_desc = []
+    prev_balance = None
     current = None
+    pending_desc = []
 
-    # ------------------------------------------------------------
-    # Parse pages
-    # ------------------------------------------------------------
+    # -------------------------------------------------
+    # 2️⃣ Main parsing
+    # -------------------------------------------------
     for page_idx, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
         lines = [l.strip() for l in text.splitlines() if l.strip()]
 
         for line in lines:
-
-            # ---- must contain a money amount to matter
-            amounts = amount_re.findall(line)
-            if not amounts:
-                pending_desc.append(line)
+            # Skip headers / noise
+            if any(h in line for h in [
+                "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit",
+                "Balance", "ORDINARY CURRENT", "QARD CURRENT",
+                "Total Count", "IMPORTANT NOTES"
+            ]):
                 continue
 
-            # ---- must start with a date to start a transaction
+            # ------------------------------
+            # DATE LINE (new transaction)
+            # ------------------------------
             dm = date_re.match(line)
-            if not dm:
+            if dm:
+                # Flush previous transaction
                 if current:
-                    current["description"] += " " + line
-                continue
+                    transactions.append(current)
+                    prev_balance = current.get("balance", prev_balance)
 
-            # ---- flush previous transaction
-            if current:
-                transactions.append(current)
+                day, mon = dm.group(1), dm.group(2)
+                try:
+                    dt = datetime.datetime.strptime(f"{day}{mon}{year}", "%d%b%Y").date()
+                    date_out = dt.isoformat()
+                except Exception:
+                    date_out = f"{day} {mon} {year}"
 
-            day, mon = dm.group(1), dm.group(2)
-            try:
-                tx_date = datetime.datetime.strptime(
-                    f"{day}{mon}{year}", "%d%b%Y"
-                ).date().isoformat()
-            except Exception:
-                tx_date = f"{day} {mon} {year}"
+                # Handle B/F and C/F balance rows
+                if "B/F BALANCE" in line or "C/F BALANCE" in line:
+                    amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
+                    if amts:
+                        prev_balance = amts[-1]
+                    current = None
+                    pending_desc = []
+                    continue
 
-            nums = [float(a.replace(",", "")) for a in amounts]
+                # Extract amounts
+                amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
 
-            debit = credit = 0.0
-            balance = nums[-1]
+                debit = credit = 0.0
+                balance = None
 
-            # Simple, stable rules
-            if len(nums) == 3:
-                debit, credit = nums[0], nums[1]
-            elif len(nums) == 2:
-                debit = nums[0]  # movement exists → count it
+                if len(amts) == 3:
+                    debit, credit, balance = amts
+                elif len(amts) == 2:
+                    amt, balance = amts
+                    if prev_balance is not None:
+                        if abs(prev_balance + amt - balance) < 0.02:
+                            credit = amt
+                        elif abs(prev_balance - amt - balance) < 0.02:
+                            debit = amt
+                        else:
+                            debit = amt
+                    else:
+                        debit = amt
+                elif len(amts) == 1:
+                    balance = amts[0]
 
-            desc = line
-            for a in amounts:
-                desc = desc.replace(a, "")
-            desc = desc.replace(day, "").replace(mon, "").strip()
+                # Build description
+                desc = line
+                for a in num_re.findall(desc):
+                    desc = desc.replace(a, "")
+                desc = desc.replace(day, "").replace(mon, "").strip()
 
-            if pending_desc:
-                desc = " ".join(pending_desc) + " " + desc
-                pending_desc = []
+                # Prepend buffered description (lines BEFORE date)
+                if pending_desc:
+                    desc = " ".join(pending_desc) + " " + desc
+                    pending_desc = []
 
-            current = {
-                "date": tx_date,
-                "description": " ".join(desc.split()),
-                "debit": round(debit, 2),
-                "credit": round(credit, 2),
-                "balance": round(balance, 2),
-                "page": page_idx,
-                "bank": bank_name,
-                "source_file": source_file
-            }
+                current = {
+                    "date": date_out,
+                    "description": " ".join(desc.split()),
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                    "page": page_idx,
+                    "bank": bank_name,
+                    "source_file": source_file
+                }
+
+            # ------------------------------
+            # NON-DATE LINE
+            # ------------------------------
+            else:
+                # Fee row (SC DR 0.50) → merge into next tx
+                if "SC DR" in line and num_re.search(line):
+                    continue
+
+                if current:
+                    current["description"] = " ".join((current["description"] + " " + line).split())
+                else:
+                    # Description BEFORE date (Islamic format)
+                    pending_desc.append(line)
 
         if current:
             transactions.append(current)
+            prev_balance = current.get("balance", prev_balance)
             current = None
 
     return transactions
-
-
-# ============================================================
-# STRICT NORMALIZATION (ONLY REAL TRANSACTIONS)
-# ============================================================
-
-def normalize_transactions(transactions):
-    return [
-        tx for tx in transactions
-        if tx.get("debit", 0) != 0 or tx.get("credit", 0) != 0
-    ]
-
-
-# ============================================================
-# TOTAL CALCULATION (SOURCE OF TRUTH)
-# ============================================================
-
-def calculate_totals(transactions):
-    valid_tx = normalize_transactions(transactions)
-
-    total_debit = sum(tx["debit"] for tx in valid_tx)
-    total_credit = sum(tx["credit"] for tx in valid_tx)
-    net_change = total_credit - total_debit
-
-    return {
-        "transaction_count": len(valid_tx),
-        "total_debit": round(total_debit, 2),
-        "total_credit": round(total_credit, 2),
-        "net_change": round(net_change, 2),
-    }
