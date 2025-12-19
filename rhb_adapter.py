@@ -2,8 +2,9 @@
 import re
 import datetime
 
-BANK_NAME = "RHB Bank"
-
+# =================================================
+# COMMON CONFIG
+# =================================================
 date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
@@ -18,17 +19,17 @@ SUMMARY_KEYWORDS = [
     "IMPORTANT NOTES",
     "MEMBER OF PIDM",
     "ALL INFORMATION AND BALANCES",
+    "TOTAL COUNT",
 ]
 
-
+# =================================================
+# HELPERS
+# =================================================
 def is_summary_row(text: str) -> bool:
-    text = text.upper()
-    return any(k in text for k in SUMMARY_KEYWORDS)
+    t = text.upper()
+    return any(k in t for k in SUMMARY_KEYWORDS)
 
 
-# -------------------------------------------------
-# Detect column X ranges from header
-# -------------------------------------------------
 def detect_columns(page):
     debit_x = credit_x = balance_x = None
 
@@ -44,35 +45,26 @@ def detect_columns(page):
     return debit_x, credit_x, balance_x
 
 
-# -------------------------------------------------
-# MAIN PARSER
-# -------------------------------------------------
-def parse_transactions_rhb(pdf, source_file):
+def detect_year(pdf):
+    text = pdf.pages[0].extract_text() or ""
+    m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", text)
+    return int("20" + m.group(1)) if m else datetime.date.today().year
+
+
+# =================================================
+# CORE PARSER (USED BY BOTH)
+# =================================================
+def _parse_rhb_core(pdf, source_file, bank_name):
     transactions = []
     prev_balance = None
-    current = None
+    year = detect_year(pdf)
 
-    # -------------------------------------------------
-    # Detect YEAR from header
-    # -------------------------------------------------
-    header_text = pdf.pages[0].extract_text() or ""
-    m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
-    year = int("20" + m.group(1)) if m else datetime.date.today().year
-
-    # -------------------------------------------------
-    # Detect column X positions
-    # -------------------------------------------------
     debit_x, credit_x, balance_x = detect_columns(pdf.pages[0])
 
-    # -------------------------------------------------
-    # Parse pages
-    # -------------------------------------------------
     for page_no, page in enumerate(pdf.pages, start=1):
-        text = page.extract_text() or ""
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lines = [l.strip() for l in (page.extract_text() or "").splitlines() if l.strip()]
         words = page.extract_words()
 
-        # Map line → words
         line_words = {}
         for w in words:
             for line in lines:
@@ -82,7 +74,6 @@ def parse_transactions_rhb(pdf, source_file):
 
         for line in lines:
 
-            # Skip non-transaction rows
             if is_summary_row(line):
                 continue
 
@@ -94,91 +85,99 @@ def parse_transactions_rhb(pdf, source_file):
                 continue
 
             dm = date_re.match(line)
-
-            # ==============================
-            # DATE LINE → new transaction
-            # ==============================
-            if dm:
-                if current:
-                    transactions.append(current)
-                    prev_balance = current["balance"]
-
-                day, mon = dm.groups()
-                try:
-                    tx_date = datetime.datetime.strptime(
-                        f"{day}{mon}{year}", "%d%b%Y"
-                    ).date().isoformat()
-                except:
-                    tx_date = f"{day} {mon} {year}"
-
-                debit = credit = 0.0
-                balance = None
-
-                nums = []
-                for w in line_words.get(line, []):
-                    txt = w["text"].replace(",", "")
-                    if num_re.fullmatch(txt):
-                        nums.append({
-                            "val": float(txt),
-                            "x": w["x0"],
-                            "x1": w["x1"]
-                        })
-
-                nums.sort(key=lambda x: x["x"])
-
-                # Rightmost number = balance
-                if nums:
-                    balance = nums[-1]["val"]
-                    txn_nums = nums[:-1]
-                else:
-                    txn_nums = []
-
-                # Assign by X-axis
-                for n in txn_nums:
-                    x_mid = (n["x"] + n["x1"]) / 2
-                    if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
-                        debit = n["val"]
-                    elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
-                        credit = n["val"]
-
-                # 🔒 Final authority → balance difference
-                if prev_balance is not None and balance is not None:
-                    diff = round(balance - prev_balance, 2)
-                    if diff > 0:
-                        credit = diff
-                        debit = 0.0
-                    elif diff < 0:
-                        debit = abs(diff)
-                        credit = 0.0
-
-                # -------------------------------------------------
-                # DESCRIPTION: FIRST LINE ONLY
-                # -------------------------------------------------
-                desc = line
-                for a in num_re.findall(desc):
-                    desc = desc.replace(a, "")
-                desc = desc.replace(day, "").replace(mon, "").strip()
-
-                current = {
-                    "date": tx_date,
-                    "description": " ".join(desc.split()),
-                    "debit": round(debit, 2),
-                    "credit": round(credit, 2),
-                    "balance": round(balance, 2) if balance is not None else None,
-                    "page": page_no,
-                    "bank": BANK_NAME,
-                    "source_file": source_file
-                }
-
-            # ==============================
-            # CONTINUATION LINE → IGNORE
-            # ==============================
-            else:
+            if not dm:
                 continue
 
-        if current:
-            transactions.append(current)
-            prev_balance = current["balance"]
-            current = None
+            day, mon = dm.groups()
+            try:
+                tx_date = datetime.datetime.strptime(
+                    f"{day}{mon}{year}", "%d%b%Y"
+                ).date().isoformat()
+            except:
+                tx_date = f"{day} {mon} {year}"
+
+            debit = credit = 0.0
+            balance = None
+
+            nums = []
+            for w in line_words.get(line, []):
+                txt = w["text"].replace(",", "")
+                if num_re.fullmatch(txt):
+                    nums.append({
+                        "val": float(txt),
+                        "x": w["x0"],
+                        "x1": w["x1"]
+                    })
+
+            nums.sort(key=lambda x: x["x"])
+
+            if nums:
+                balance = nums[-1]["val"]
+                txn_nums = nums[:-1]
+            else:
+                txn_nums = []
+
+            for n in txn_nums:
+                x_mid = (n["x"] + n["x1"]) / 2
+                if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
+                    debit = n["val"]
+                elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
+                    credit = n["val"]
+
+            # 🔒 FINAL AUTHORITY
+            if prev_balance is not None and balance is not None:
+                diff = round(balance - prev_balance, 2)
+                if diff > 0:
+                    credit = diff
+                    debit = 0.0
+                elif diff < 0:
+                    debit = abs(diff)
+                    credit = 0.0
+
+            # FIRST LINE DESCRIPTION ONLY
+            desc = line
+            for a in num_re.findall(desc):
+                desc = desc.replace(a, "")
+            desc = desc.replace(day, "").replace(mon, "").strip()
+
+            tx = {
+                "date": tx_date,
+                "description": " ".join(desc.split()),
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2) if balance is not None else None,
+                "page": page_no,
+                "bank": bank_name,
+                "source_file": source_file
+            }
+
+            transactions.append(tx)
+            prev_balance = balance
 
     return transactions
+
+
+# =================================================
+# SECTION 1: RHB ISLAMIC
+# =================================================
+def parse_rhb_islamic(pdf, source_file):
+    return _parse_rhb_core(pdf, source_file, "RHB Islamic Bank")
+
+
+# =================================================
+# SECTION 2: RHB CONVENTIONAL
+# =================================================
+def parse_rhb_conventional(pdf, source_file):
+    return _parse_rhb_core(pdf, source_file, "RHB Bank")
+
+
+# =================================================
+# PUBLIC ENTRY (USED BY app.py)
+# =================================================
+def parse_transactions_rhb(pdf, source_file):
+    header = pdf.pages[0].extract_text() or ""
+
+    if "RHB ISLAMIC BANK" in header.upper():
+        return parse_rhb_islamic(pdf, source_file)
+    else:
+        return parse_rhb_conventional(pdf, source_file)
