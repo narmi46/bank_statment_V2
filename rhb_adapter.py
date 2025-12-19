@@ -7,6 +7,23 @@ BANK_NAME = "RHB Bank"
 date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
+SUMMARY_KEYWORDS = [
+    "B/F BALANCE",
+    "C/F BALANCE",
+    "BALANCE B/F",
+    "BALANCE C/F",
+    "ACCOUNT SUMMARY",
+    "RINGKASAN AKAUN",
+    "DEPOSIT ACCOUNT SUMMARY",
+    "IMPORTANT NOTES",
+    "MEMBER OF PIDM",
+]
+
+
+def is_summary_row(text: str) -> bool:
+    text = text.upper()
+    return any(k in text for k in SUMMARY_KEYWORDS)
+
 
 # -------------------------------------------------
 # Detect column X ranges from header
@@ -31,21 +48,16 @@ def detect_columns(page):
 # -------------------------------------------------
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
-
     prev_balance = None
     current = None
     pending_desc = []
 
     # -------------------------------------------------
-    # Detect YEAR from statement header
+    # Detect YEAR from header
     # -------------------------------------------------
-    year = None
     header_text = pdf.pages[0].extract_text() or ""
     m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
-    if m:
-        year = int("20" + m.group(1))
-    else:
-        year = datetime.date.today().year
+    year = int("20" + m.group(1)) if m else datetime.date.today().year
 
     # -------------------------------------------------
     # Detect column X positions
@@ -60,7 +72,7 @@ def parse_transactions_rhb(pdf, source_file):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # Map line → words
+        # map line → words
         line_words = {}
         for w in words:
             for line in lines:
@@ -70,14 +82,14 @@ def parse_transactions_rhb(pdf, source_file):
 
         for line in lines:
 
-            # ------------------------------
-            # Skip headers / footers
-            # ------------------------------
+            # Skip obvious non-transaction rows
+            if is_summary_row(line):
+                continue
+
             if any(h in line for h in [
-                "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit",
-                "Credit", "Balance", "Baki", "Page No",
-                "Statement Period", "IMPORTANT NOTES",
-                "Member of PIDM", "Total Count"
+                "ACCOUNT ACTIVITY", "Date", "Tarikh",
+                "Debit", "Credit", "Balance",
+                "Page No", "Statement Period"
             ]):
                 continue
 
@@ -114,16 +126,13 @@ def parse_transactions_rhb(pdf, source_file):
 
                 nums.sort(key=lambda x: x["x"])
 
-                # Rightmost number is ALWAYS balance
                 if nums:
                     balance = nums[-1]["val"]
                     txn_nums = nums[:-1]
                 else:
                     txn_nums = []
 
-                # ------------------------------
-                # Assign debit / credit by X-axis
-                # ------------------------------
+                # Assign by X-axis
                 for n in txn_nums:
                     x_mid = (n["x"] + n["x1"]) / 2
                     if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
@@ -131,12 +140,9 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # ------------------------------
-                # 🔒 FINAL AUTHORITY: BALANCE DIFF
-                # ------------------------------
+                # 🔒 FINAL AUTHORITY → balance diff
                 if prev_balance is not None and balance is not None:
                     diff = round(balance - prev_balance, 2)
-
                     if diff > 0:
                         credit = diff
                         debit = 0.0
@@ -144,9 +150,7 @@ def parse_transactions_rhb(pdf, source_file):
                         debit = abs(diff)
                         credit = 0.0
 
-                # ------------------------------
                 # Build description
-                # ------------------------------
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
