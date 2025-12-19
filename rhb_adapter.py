@@ -7,7 +7,8 @@ BANK_NAME = "RHB Bank"
 # ---------------------------
 # Regex
 # ---------------------------
-date_re = re.compile(r"^(\d{2})\s*([A-Za-z]{3})")  # 11Mar or 11 Mar
+# allow "11 Mar" and "11Mar"
+date_re = re.compile(r"^(\d{2})\s*([A-Za-z]{3})")
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
@@ -29,7 +30,7 @@ def is_summary_row(text: str) -> bool:
 
 
 # -------------------------------------------------
-# Detect column X ranges (wide)
+# Detect column X ranges (WIDENED & SAFER)
 # -------------------------------------------------
 def detect_columns(page):
     debit_x = credit_x = balance_x = None
@@ -38,11 +39,13 @@ def detect_columns(page):
         t = w["text"].lower()
 
         if t == "debit":
-            debit_x = (w["x0"] - 80, w["x1"] + 140)
+            debit_x = (w["x0"] - 80, w["x1"] + 120)
+
         elif t in ("credit", "kredit"):
-            credit_x = (w["x0"] - 80, w["x1"] + 140)
+            credit_x = (w["x0"] - 80, w["x1"] + 120)
+
         elif t in ("balance", "baki"):
-            balance_x = (w["x0"] - 120, w["x1"] + 260)
+            balance_x = (w["x0"] - 100, w["x1"] + 200)
 
     return debit_x, credit_x, balance_x
 
@@ -54,14 +57,16 @@ def parse_transactions_rhb(pdf, source_file):
     transactions = []
     prev_balance = None
     current = None
-    first_tx = True  # 🔑 key flag
 
     # -------------------------------------------------
-    # Detect YEAR (spaced & glued)
+    # Detect YEAR (supports spaced & glued formats)
     # -------------------------------------------------
     header_text = pdf.pages[0].extract_text() or ""
 
+    # "7 Mar 24 – 31 Mar 24"
     m = re.search(r"\d{1,2}\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]", header_text)
+
+    # "7Mar24–31Mar24"
     if not m:
         m = re.search(r"[A-Za-z]{3}(\d{2})", header_text)
 
@@ -77,7 +82,7 @@ def parse_transactions_rhb(pdf, source_file):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # Map line → words
+        # Map line → words (your original approach)
         line_words = {}
         for w in words:
             for line in lines:
@@ -102,11 +107,12 @@ def parse_transactions_rhb(pdf, source_file):
             if not dm:
                 continue
 
-            # Skip B/F and C/F
+            # Skip B/F and C/F completely
             up = line.upper()
             if "B/F" in up or "C/F" in up:
                 continue
 
+            # Save previous transaction
             if current:
                 transactions.append(current)
                 prev_balance = current["balance"]
@@ -130,39 +136,32 @@ def parse_transactions_rhb(pdf, source_file):
                     x_mid = (w["x0"] + w["x1"]) / 2
                     nums.append((float(txt), x_mid))
 
-            # -------------------------------------------------
-            # FIRST TRANSACTION → USE COORDINATES
-            # -------------------------------------------------
-            if first_tx:
-                for val, x_mid in nums:
-                    if balance_x and balance_x[0] <= x_mid <= balance_x[1]:
-                        balance = val
-                    elif debit_x and debit_x[0] <= x_mid <= debit_x[1]:
-                        debit = val
-                    elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
-                        credit = val
+            # Assign using coordinates
+            for val, x_mid in nums:
+                if balance_x and balance_x[0] <= x_mid <= balance_x[1]:
+                    balance = val
+                elif debit_x and debit_x[0] <= x_mid <= debit_x[1]:
+                    debit = val
+                elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
+                    credit = val
 
-                first_tx = False
+            # ✅ Balance-diff ONLY as fallback
+            if (
+                prev_balance is not None
+                and balance is not None
+                and debit == 0.0
+                and credit == 0.0
+            ):
+                diff = round(balance - prev_balance, 2)
+                if diff > 0:
+                    credit = diff
+                elif diff < 0:
+                    debit = abs(diff)
 
-            # -------------------------------------------------
-            # ALL OTHER TRANSACTIONS → USE BALANCE DIFF ONLY
-            # -------------------------------------------------
-            else:
-                # extract balance only (rightmost in range)
-                for val, x_mid in nums:
-                    if balance_x and balance_x[0] <= x_mid <= balance_x[1]:
-                        balance = val
-
-                if balance is not None and prev_balance is not None:
-                    diff = round(balance - prev_balance, 2)
-                    if diff > 0:
-                        credit = diff
-                    elif diff < 0:
-                        debit = abs(diff)
-
-            # Clean description
+            # Description: first line only
             desc = line
-            desc = re.sub(num_re, "", desc)
+            for a in num_re.findall(desc):
+                desc = desc.replace(a, "")
             desc = desc.replace(day, "").replace(mon, "")
             desc = " ".join(desc.split())
 
