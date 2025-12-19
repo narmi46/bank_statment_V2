@@ -1,12 +1,11 @@
 import re
 import datetime
 
-
 def parse_transactions_rhb(pdf, source_file):
     transactions = []
     bank_name = "RHB Bank"
 
-    # Match: "07Mar" or "07 Mar"
+    # Match both: "07Mar" and "07 Mar"
     date_re = re.compile(r'^(\d{2})\s*([A-Za-z]{3})\b')
     num_re = re.compile(r'\d[\d,]*\.\d{2}')
 
@@ -16,13 +15,9 @@ def parse_transactions_rhb(pdf, source_file):
     year = None
     for page in pdf.pages[:1]:
         text = page.extract_text() or ""
-        m = re.search(
-            r'(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]\s*(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})',
-            text
-        )
+        m = re.search(r'(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})\s*[–-]\s*(\d{1,2})\s+[A-Za-z]{3}\s+(\d{2})', text)
         if m:
             year = int("20" + m.group(2))
-
     if not year:
         year = datetime.date.today().year
 
@@ -38,31 +33,19 @@ def parse_transactions_rhb(pdf, source_file):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
 
         for line in lines:
-
-            # 🚫 Skip headers / footers / noise
+            # Skip headers / noise
             if any(h in line for h in [
                 "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit",
                 "Balance", "ORDINARY CURRENT", "QARD CURRENT",
-                "Total Count", "IMPORTANT", "Account Statement",
-                "Penyata Akaun", "Member of PIDM", "Page No"
+                "Total Count", "IMPORTANT NOTES"
             ]):
                 continue
 
             # ------------------------------
-            # DATE LINE
+            # DATE LINE (new transaction)
             # ------------------------------
             dm = date_re.match(line)
             if dm:
-
-                # 🚫 HARD SKIP opening & closing balance rows
-                if "B/F BALANCE" in line or "C/F BALANCE" in line:
-                    amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
-                    if amts:
-                        prev_balance = amts[-1]
-                    current = None
-                    pending_desc = []
-                    continue
-
                 # Flush previous transaction
                 if current:
                     transactions.append(current)
@@ -70,12 +53,19 @@ def parse_transactions_rhb(pdf, source_file):
 
                 day, mon = dm.group(1), dm.group(2)
                 try:
-                    dt = datetime.datetime.strptime(
-                        f"{day}{mon}{year}", "%d%b%Y"
-                    ).date()
+                    dt = datetime.datetime.strptime(f"{day}{mon}{year}", "%d%b%Y").date()
                     date_out = dt.isoformat()
                 except Exception:
                     date_out = f"{day} {mon} {year}"
+
+                # Handle B/F and C/F balance rows
+                if "B/F BALANCE" in line or "C/F BALANCE" in line:
+                    amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
+                    if amts:
+                        prev_balance = amts[-1]
+                    current = None
+                    pending_desc = []
+                    continue
 
                 # Extract amounts
                 amts = [float(a.replace(",", "")) for a in num_re.findall(line)]
@@ -90,17 +80,22 @@ def parse_transactions_rhb(pdf, source_file):
                     if prev_balance is not None:
                         if abs(prev_balance + amt - balance) < 0.02:
                             credit = amt
+                        elif abs(prev_balance - amt - balance) < 0.02:
+                            debit = amt
                         else:
                             debit = amt
                     else:
                         debit = amt
+                elif len(amts) == 1:
+                    balance = amts[0]
 
-                # Clean description
+                # Build description
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
                 desc = desc.replace(day, "").replace(mon, "").strip()
 
+                # Prepend buffered description (lines BEFORE date)
                 if pending_desc:
                     desc = " ".join(pending_desc) + " " + desc
                     pending_desc = []
@@ -120,29 +115,20 @@ def parse_transactions_rhb(pdf, source_file):
             # NON-DATE LINE
             # ------------------------------
             else:
-                # Skip fee helper rows like "SC DR 0.50"
+                # Fee row (SC DR 0.50) → merge into next tx
                 if "SC DR" in line and num_re.search(line):
                     continue
 
                 if current:
-                    current["description"] = " ".join(
-                        (current["description"] + " " + line).split()
-                    )
+                    current["description"] = " ".join((current["description"] + " " + line).split())
                 else:
+                    # Description BEFORE date (Islamic format)
                     pending_desc.append(line)
 
-        # Flush last transaction on page
         if current:
             transactions.append(current)
             prev_balance = current.get("balance", prev_balance)
             current = None
 
-    # -------------------------------------------------
-    # 3️⃣ Final cleanup (safety net)
-    # -------------------------------------------------
-    transactions = [
-        t for t in transactions
-        if t["debit"] > 0 or t["credit"] > 0
-    ]
-
+    
     return transactions
