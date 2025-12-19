@@ -165,15 +165,11 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX / CASH MANAGEMENT — FIXED
+# 3️⃣ RHB REFLEX / CASH MANAGEMENT — FINAL & CORRECT
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
-
-    import re
-    import fitz
-    from datetime import datetime
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
@@ -190,16 +186,14 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     def norm_date(t: str) -> str:
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    # ======================================================
-    # 1️⃣ OPENING BALANCE — FROM DEPOSIT ACCOUNT SUMMARY
-    # ======================================================
+    # ---------- Opening Balance from Deposit Account Summary ----------
     opening_balance = None
-    summary_text = doc[0].get_text("text")
+    text = doc[0].get_text("text")
 
-    if "Deposit Account Summary" in summary_text:
+    if "Deposit Account Summary" in text:
         m = re.search(
             r"Beginning Balance.*?(\d{1,3}(?:,\d{3})*\.\d{2}-)",
-            summary_text,
+            text,
             re.DOTALL
         )
         if m:
@@ -209,12 +203,9 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     previous_balance = opening_balance
 
-    # ======================================================
-    # 2️⃣ TRANSACTION PARSER (LAYOUT-BASED)
-    # ======================================================
+    # ---------- Transactions ----------
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
-
         rows = [{
             "x": w[0],
             "y": round(w[1], 1),
@@ -228,13 +219,12 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if not DATE_RE.match(r["text"]):
                 continue
 
-            y_key = r["y"]
-            if y_key in used_y:
+            y = r["y"]
+            if y in used_y:
                 continue
 
             date_iso = norm_date(r["text"])
-
-            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+            line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
             description = []
@@ -251,7 +241,6 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if not money_vals:
                 continue
 
-            # Rightmost money value is the balance
             balance = parse_money(
                 max(money_vals, key=lambda m: m["x"])["text"]
             )
@@ -276,7 +265,25 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             })
 
             previous_balance = balance
-            used_y.add(y_key)
+            used_y.add(y)
 
     doc.close()
     return transactions
+
+
+# ======================================================
+# 🚦 FINAL ENTRYPOINT (IMPORT SAFE)
+# ======================================================
+def parse_transactions_rhb(pdf_input, source_filename):
+    pdf_bytes = _read_pdf_bytes(pdf_input)
+
+    for parser in (
+        _parse_rhb_islamic_text,
+        _parse_rhb_conventional_text,
+        _parse_rhb_reflex_layout,
+    ):
+        tx = parser(pdf_bytes, source_filename)
+        if tx:
+            return tx
+
+    return []
