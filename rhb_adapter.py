@@ -3,9 +3,9 @@ import datetime
 
 BANK_NAME = "RHB Bank"
 
-# Matches "DD MMM" at the start of a line
+# Matches "DD MMM" at the start of a line (e.g., "07 Mar") 
 date_re = re.compile(r"^(\d{2})\s+([A-Za-z]{3})")
-# Matches currency formatted numbers (e.g., 1,000.00)
+# Matches currency formatted numbers (e.g., 1,000.00) 
 num_re = re.compile(r"\d[\d,]*\.\d{2}")
 
 SUMMARY_KEYWORDS = [
@@ -46,14 +46,14 @@ def parse_transactions_rhb(pdf, source_file):
     current = None
 
     # -------------------------------------------------
-    # Robust Year Detection (Handles both formats)
+    # Robust Year Detection
     # -------------------------------------------------
     header_text = pdf.pages[0].extract_text() or ""
-    # Looks for 'MMM YY-' or 'MMM YY ' patterns 
+    # Matches 'Mar 24'  or 'Jan 25' [cite: 130] in the statement period
     m = re.search(r"([A-Za-z]{3})\s+(\d{2})[\s\-–]", header_text)
     year = int("20" + m.group(2)) if m else datetime.date.today().year
 
-    # Detect column X positions from the first page header
+    # Detect column X positions from the first page
     debit_x, credit_x, balance_x = detect_columns(pdf.pages[0])
 
     for page_no, page in enumerate(pdf.pages, start=1):
@@ -61,18 +61,19 @@ def parse_transactions_rhb(pdf, source_file):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # Group words by their vertical position (line)
+        # Map line → words based on vertical alignment
         line_words = {}
         for w in words:
-            # Simple heuristic: round the top coordinate to group words on the same line
             y_coord = round(w["top"])
             line_words.setdefault(y_coord, []).append(w)
 
         for line in lines:
-            # Skip summary and header noise [cite: 12, 22, 133, 151]
+            # Skip non-transaction rows [cite: 12, 133]
             if is_summary_row(line):
                 continue
-            if any(h in line for h in ["ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit", "Balance", "Page No"]):
+            
+            # Skip Table Headers 
+            if any(h in line for h in ["Date", "Tarikh", "Description", "Diskripsi", "Debit", "Credit", "Balance"]):
                 continue
 
             dm = date_re.match(line)
@@ -81,7 +82,6 @@ def parse_transactions_rhb(pdf, source_file):
             # DATE LINE → New Transaction
             # ==============================
             if dm:
-                # If a previous transaction was being built, save it
                 if current:
                     transactions.append(current)
                     prev_balance = current["balance"]
@@ -97,7 +97,7 @@ def parse_transactions_rhb(pdf, source_file):
                 debit = credit = 0.0
                 balance = None
 
-                # Find words belonging to this specific text line to check coordinates
+                # Find words for the current line to verify column positions
                 current_line_words = []
                 for y in line_words:
                     line_str = " ".join([w["text"] for w in sorted(line_words[y], key=lambda x: x["x0"])])
@@ -117,14 +117,12 @@ def parse_transactions_rhb(pdf, source_file):
 
                 nums.sort(key=lambda x: x["x"])
 
-                # Rightmost number is the Balance 
                 if nums:
                     balance = nums[-1]["val"]
                     txn_nums = nums[:-1]
                 else:
                     txn_nums = []
 
-                # Assign Debit/Credit based on X-axis coordinates
                 for n in txn_nums:
                     x_mid = (n["x"] + n["x1"]) / 2
                     if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
@@ -132,7 +130,7 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # Arithmetic Validation using balance difference [cite: 22]
+                # Arithmetic Validation 
                 if prev_balance is not None and balance is not None:
                     diff = round(balance - prev_balance, 2)
                     if diff > 0:
@@ -140,7 +138,7 @@ def parse_transactions_rhb(pdf, source_file):
                     elif diff < 0:
                         debit, credit = abs(diff), 0.0
 
-                # Extract only the first line of the description
+                # Extract only the first line of the description 
                 desc = line
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
@@ -157,14 +155,10 @@ def parse_transactions_rhb(pdf, source_file):
                     "source_file": source_file
                 }
 
-            # ==============================
-            # CONTINUATION LINE → IGNORE (As requested)
-            # ==============================
             else:
-                # We do not append to current["description"] here to stick to Line 1 only.
+                # Ignore continuation lines to keep only line 1 of description
                 continue
 
-    # Append the very last transaction of the file
     if current:
         transactions.append(current)
 
