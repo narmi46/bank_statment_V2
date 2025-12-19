@@ -99,56 +99,87 @@ def parse_transactions_rhb(pdf, source_filename):
                 previous_balance = balance
         return transactions
 
-    # =========================================================================
-    # OPTION 2: ORDINARY CURRENT ACCOUNT FORMAT (e.g., Azlan Boutique)
-    # =========================================================================
-    else:
-        # Improved Year Detection: Looks for '7 Mar 24' or similar in the header
-        year_val = "2024" 
-        header_match = re.search(r"Tempoh Penyata:\s+\d{1,2}\s+\w{3}\s+(\d{2})", first_page_text)
-        if header_match:
-            year_val = "20" + header_match.group(1)
-
-        transactions = []
-        for page in pdf.pages:
-            # Using a more robust table extraction setting for grid layouts
-            table = page.extract_table({
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "lines",
-                "intersection_y_tolerance": 10 # Helps catch multi-line descriptions
-            })
-            
-            if not table: continue
-            
-            for row in table:
-                # Filter out None/empty and strip whitespace
-                row = [str(c).strip() if c else "" for c in row]
-                
-                # Check for the date format "07 Mar" [cite: 52]
-                if len(row) < 6 or not CURRENT_DATE_RE.match(row[0]): 
-                    continue
-                
-                # Skip summary lines [cite: 52, 113]
-                desc_upper = row[1].upper()
-                if any(x in desc_upper for x in ["B/F BALANCE", "C/F BALANCE", "TOTAL COUNT"]):
-                    continue
-                
-                try:
-                    # Normalize date using detected year 
-                    date_obj = datetime.strptime(f"{row[0]} {year_val}", "%d %b %Y")
-                    date_iso = date_obj.strftime("%Y-%m-%d")
-                    
-                    transactions.append({
-                        "date": date_iso,
-                        "description": row[1].replace("\n", " ")[:200],
-                        "debit": parse_money(row[3]), # [cite: 52]
-                        "credit": parse_money(row[4]), # [cite: 52]
-                        "balance": parse_money(row[5]), # [cite: 52]
-                        "page": page.page_number,
-                        "bank": "RHB Bank (Current)",
-                        "source_file": source_filename
-                    })
-                except Exception:
-                    continue
-                    
-        return transactions
+        # =========================================================================
+        # OPTION 2: ORDINARY CURRENT ACCOUNT FORMAT (MATCHES PDF)
+        # =========================================================================
+        else:
+            # Detect year from header: "7 Mar 24 – 31 Mar 24"
+            year_match = re.search(r"Tempoh Penyata\s*:\s*\d{1,2}\s+\w{3}\s+(\d{2})", first_page_text)
+            year_val = "20" + year_match.group(1) if year_match else "2024"
+        
+            transactions = []
+            last_txn = None
+        
+            for page in pdf.pages:
+                words = page.extract_words()
+                lines = {}
+                for w in words:
+                    y = round(w["top"], 1)
+                    lines.setdefault(y, []).append(w)
+        
+                for y in sorted(lines.keys()):
+                    line = sorted(lines[y], key=lambda w: w["x0"])
+                    text_line = " ".join(w["text"] for w in line)
+        
+                    # ---------------- START OF NEW TRANSACTION ----------------
+                    if line and CURRENT_DATE_RE.match(line[0]["text"]):
+                        if any(x in text_line.upper() for x in ["B/F BALANCE", "C/F BALANCE", "TOTAL COUNT"]):
+                            continue
+        
+                        date_raw = line[0]["text"]
+                        try:
+                            date_iso = datetime.strptime(f"{date_raw} {year_val}", "%d %b %Y").strftime("%Y-%m-%d")
+                        except:
+                            continue
+        
+                        money_words = [w for w in line if MONEY_RE.match(w["text"])]
+                        if not money_words:
+                            continue
+        
+                        # Rightmost money is balance
+                        money_words.sort(key=lambda w: w["x0"])
+                        balance = parse_money(money_words[-1]["text"])
+        
+                        debit = credit = 0.0
+                        if len(money_words) == 2:
+                            # one movement + balance
+                            movement = parse_money(money_words[0]["text"])
+                            if " DR " in f" {text_line.upper()} ":
+                                debit = abs(movement)
+                            else:
+                                credit = abs(movement)
+                        elif len(money_words) >= 3:
+                            debit = abs(parse_money(money_words[-3]["text"]))
+                            credit = abs(parse_money(money_words[-2]["text"]))
+        
+                        desc_parts = [
+                            w["text"]
+                            for w in line
+                            if not MONEY_RE.match(w["text"])
+                            and not CURRENT_DATE_RE.match(w["text"])
+                            and not w["text"].isdigit()
+                        ]
+        
+                        last_txn = {
+                            "date": date_iso,
+                            "description": " ".join(desc_parts),
+                            "debit": debit,
+                            "credit": credit,
+                            "balance": balance,
+                            "page": page.page_number,
+                            "bank": "RHB Bank (Current)",
+                            "source_file": source_filename,
+                        }
+                        transactions.append(last_txn)
+        
+                    # ---------------- CONTINUATION LINE (DESCRIPTION WRAP) ----------------
+                    elif last_txn:
+                        extra = " ".join(w["text"] for w in line if not MONEY_RE.match(w["text"]))
+                        if extra.strip():
+                            last_txn["description"] += " " + extra
+        
+            # Final cleanup
+            for t in transactions:
+                t["description"] = t["description"].replace("\n", " ").strip()[:200]
+        
+            return transactions
