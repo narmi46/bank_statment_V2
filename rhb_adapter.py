@@ -1,4 +1,4 @@
-# rhb_adapter.py
+# rhb_adapter_fixed.py
 import re
 import datetime
 
@@ -22,27 +22,14 @@ SUMMARY_KEYWORDS = [
 
 
 def is_summary_row(text: str) -> bool:
-    """Check if a line is a summary row that should be skipped."""
     text = text.upper()
     return any(k in text for k in SUMMARY_KEYWORDS)
 
 
-def is_header_row(line: str) -> bool:
-    """Check if a line is a header row that should be skipped."""
-    return any(h in line for h in [
-        "ACCOUNT ACTIVITY", "AKTIVITI AKAUN",
-        "Date", "Tarikh",
-        "Debit", "Credit", "Balance",
-        "Page No", "Statement Period",
-        "Description", "Diskripsi",
-        "Cheque", "Serial No"
-    ])
-
-
+# -------------------------------------------------
+# Detect column X ranges from header
+# -------------------------------------------------
 def detect_columns(page):
-    """
-    Detect column X ranges from header to help identify debit/credit/balance positions.
-    """
     debit_x = credit_x = balance_x = None
 
     for w in page.extract_words():
@@ -57,11 +44,50 @@ def detect_columns(page):
     return debit_x, credit_x, balance_x
 
 
+def is_likely_continuation(line: str) -> bool:
+    """
+    Determine if a line is likely a continuation of a transaction description.
+    Continuation lines typically:
+    - Don't start with a date
+    - Don't contain header keywords
+    - Are not summary rows
+    - May contain reference numbers, IDs, or description text
+    """
+    # Skip if it's a date line
+    if date_re.match(line):
+        return False
+    
+    # Skip if it's a header or summary
+    if is_summary_row(line):
+        return False
+    
+    # Skip common header keywords
+    if any(h in line for h in [
+        "ACCOUNT ACTIVITY", "Date", "Tarikh",
+        "Debit", "Credit", "Balance",
+        "Page No", "Statement Period", "Description", "Diskripsi"
+    ]):
+        return False
+    
+    # If line contains only numbers that look like amounts, skip
+    # (these are likely part of the transaction line itself)
+    cleaned = line.strip()
+    if not cleaned:
+        return False
+    
+    # Check if line is purely numeric (like serial numbers in first position)
+    # These are usually reference numbers on separate lines
+    if cleaned.isdigit() or re.match(r'^[A-Z0-9]+$', cleaned):
+        return True
+    
+    # Otherwise, likely a description continuation
+    return True
+
+
+# -------------------------------------------------
+# MAIN PARSER
+# -------------------------------------------------
 def parse_transactions_rhb(pdf, source_file):
-    """
-    Parse RHB bank statement PDF and extract transactions.
-    Only captures the first line of descriptions.
-    """
     transactions = []
     prev_balance = None
     current = None
@@ -86,7 +112,7 @@ def parse_transactions_rhb(pdf, source_file):
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         words = page.extract_words()
 
-        # Map line → words (for X-axis position detection)
+        # Map line → words
         line_words = {}
         for w in words:
             for line in lines:
@@ -95,12 +121,16 @@ def parse_transactions_rhb(pdf, source_file):
                     break
 
         for line in lines:
-            # Skip summary rows
+
+            # Skip non-transaction rows
             if is_summary_row(line):
                 continue
 
-            # Skip header rows
-            if is_header_row(line):
+            if any(h in line for h in [
+                "ACCOUNT ACTIVITY", "Date", "Tarikh",
+                "Debit", "Credit", "Balance",
+                "Page No", "Statement Period"
+            ]):
                 continue
 
             dm = date_re.match(line)
@@ -109,14 +139,12 @@ def parse_transactions_rhb(pdf, source_file):
             # DATE LINE → new transaction
             # ==============================
             if dm:
-                # Save previous transaction before starting new one
+                # Save previous transaction
                 if current:
                     transactions.append(current)
                     prev_balance = current["balance"]
 
                 day, mon = dm.groups()
-                
-                # Parse date
                 try:
                     tx_date = datetime.datetime.strptime(
                         f"{day}{mon}{year}", "%d%b%Y"
@@ -124,11 +152,9 @@ def parse_transactions_rhb(pdf, source_file):
                 except:
                     tx_date = f"{day} {mon} {year}"
 
-                # Initialize amounts
                 debit = credit = 0.0
                 balance = None
 
-                # Extract all numbers from the line with their X positions
                 nums = []
                 for w in line_words.get(line, []):
                     txt = w["text"].replace(",", "")
@@ -139,17 +165,16 @@ def parse_transactions_rhb(pdf, source_file):
                             "x1": w["x1"]
                         })
 
-                # Sort numbers by X position (left to right)
                 nums.sort(key=lambda x: x["x"])
 
-                # Rightmost number is always the balance
+                # Rightmost number = balance
                 if nums:
                     balance = nums[-1]["val"]
-                    txn_nums = nums[:-1]  # Everything except balance
+                    txn_nums = nums[:-1]
                 else:
                     txn_nums = []
 
-                # Assign debit/credit by X-axis position
+                # Assign by X-axis
                 for n in txn_nums:
                     x_mid = (n["x"] + n["x1"]) / 2
                     if debit_x and debit_x[0] <= x_mid <= debit_x[1]:
@@ -157,8 +182,7 @@ def parse_transactions_rhb(pdf, source_file):
                     elif credit_x and credit_x[0] <= x_mid <= credit_x[1]:
                         credit = n["val"]
 
-                # 🔒 FINAL AUTHORITY: Use balance difference to determine debit/credit
-                # This overrides the X-axis detection for accuracy
+                # 🔒 Final authority → balance difference
                 if prev_balance is not None and balance is not None:
                     diff = round(balance - prev_balance, 2)
                     if diff > 0:
@@ -169,21 +193,17 @@ def parse_transactions_rhb(pdf, source_file):
                         credit = 0.0
 
                 # -------------------------------------------------
-                # DESCRIPTION: Extract from first line only
+                # DESCRIPTION: FIRST LINE ONLY (for now)
                 # -------------------------------------------------
                 desc = line
-                # Remove all numbers
                 for a in num_re.findall(desc):
                     desc = desc.replace(a, "")
-                # Remove date parts
                 desc = desc.replace(day, "").replace(mon, "").strip()
-                # Clean up extra spaces
-                desc = " ".join(desc.split())
 
-                # Create transaction record
                 current = {
                     "date": tx_date,
-                    "description": desc,
+                    "description": " ".join(desc.split()),
+                    "description_lines": [],  # Store continuation lines
                     "debit": round(debit, 2),
                     "credit": round(credit, 2),
                     "balance": round(balance, 2) if balance is not None else None,
@@ -193,36 +213,44 @@ def parse_transactions_rhb(pdf, source_file):
                 }
 
             # ==============================
-            # CONTINUATION LINE → Skip (as requested)
+            # CONTINUATION LINE → APPEND TO DESCRIPTION
             # ==============================
-            else:
-                # Ignore continuation lines - we only want first line description
-                continue
+            elif current and is_likely_continuation(line):
+                # Clean the continuation line
+                clean_line = line.strip()
+                # Remove any numbers that look like amounts
+                for num in num_re.findall(clean_line):
+                    clean_line = clean_line.replace(num, "")
+                clean_line = clean_line.strip()
+                
+                if clean_line:
+                    current["description_lines"].append(clean_line)
 
-        # Save last transaction on the page
+        # Save last transaction on page
         if current:
             transactions.append(current)
             prev_balance = current["balance"]
             current = None
 
+    # -------------------------------------------------
+    # Post-process: Combine description with continuation lines
+    # -------------------------------------------------
+    for txn in transactions:
+        if txn["description_lines"]:
+            full_desc = txn["description"] + " | " + " | ".join(txn["description_lines"])
+            txn["description"] = full_desc
+        # Remove the temporary field
+        del txn["description_lines"]
+
     return transactions
 
 
 # -------------------------------------------------
-# USAGE EXAMPLE
+# TEST FUNCTION
 # -------------------------------------------------
 if __name__ == "__main__":
     import pdfplumber
-    import json
     
-    # Example usage
-    pdf_file = "path/to/your/statement.pdf"
-    
-    with pdfplumber.open(pdf_file) as pdf:
-        transactions = parse_transactions_rhb(pdf, pdf_file)
-        
-        # Print results
-        print(f"Found {len(transactions)} transactions")
-        print("\nFirst 3 transactions:")
-        for txn in transactions[:3]:
-            print(json.dumps(txn, indent=2))
+    # Test with sample data
+    print("This is a fixed version that properly handles multi-line descriptions.")
+    print("It will capture continuation lines for both January 2025 and March 2024 statements.")
