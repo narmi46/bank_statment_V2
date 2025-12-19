@@ -2,10 +2,10 @@ import re
 from datetime import datetime
 
 def parse_transactions_rhb(pdf, source_filename):
-    # ---------------- COMMON REGEX & HELPERS ----------------
+    # ---------------- REGEX & HELPERS ----------------
     MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
     REFLEX_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    # Matches "07 Mar", "11 Mar", etc.
+    # Matches "07 Mar" style dates found in the Boutique statement
     CURRENT_DATE_RE = re.compile(r"^\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$")
 
     def parse_money(t: str) -> float:
@@ -18,19 +18,20 @@ def parse_transactions_rhb(pdf, source_filename):
             return -v if neg else v
         except ValueError: return 0.0
 
-    # ---------------- FORMAT DETECTION ----------------
+    # ---------------- DETECTION ----------------
+    # Extract text from the first page to determine the format
     first_page_text = pdf.pages[0].extract_text()
-    is_reflex = "REFLEX" in first_page_text.upper() or "21413800157991" in first_page_text [cite: 7, 8]
+    is_reflex = "REFLEX" in first_page_text.upper() or "21413800157991" in first_page_text
 
     # =========================================================================
-    # OPTION 1: REFLEX FORMAT (Using Coordinate Logic)
+    # FORMAT 1: REFLEX (e.g., Clear Water Services)
     # =========================================================================
     if is_reflex:
         opening_balance = None
         words = pdf.pages[0].extract_words()
         words.sort(key=lambda w: (round(w['top'], 1), w['x0']))
         
-        # Capture Opening Balance [cite: 17, 18]
+        # Search for Beginning Balance anchor to fix the missing April 2nd credit
         for i, w in enumerate(words):
             if "BEGINNING" in w['text'].upper():
                 context = " ".join([word['text'].upper() for word in words[i:i+5]])
@@ -59,6 +60,7 @@ def parse_transactions_rhb(pdf, source_filename):
                 desc = " ".join([w['text'] for w in line if not MONEY_RE.match(w['text']) and not REFLEX_DATE_RE.match(w['text'])])
                 
                 if not money_vals: continue
+                # In Reflex, the rightmost money value is the running balance
                 balance = parse_money(max(money_vals, key=lambda m: m['x0'])['text'])
                 
                 debit = credit = 0.0
@@ -76,10 +78,10 @@ def parse_transactions_rhb(pdf, source_filename):
         return transactions
 
     # =========================================================================
-    # OPTION 2: CURRENT ACCOUNT FORMAT (AZLAN BOUTIQUE - Coordinate Logic)
+    # FORMAT 2: ORDINARY CURRENT ACCOUNT (e.g., Azlan Boutique)
     # =========================================================================
     else:
-        # Detect Year: Matches "31 Mar 24" -> "2024" [cite: 36]
+        # Detect year from statement header (e.g., "7 Mar 24") 
         year_match = re.search(r"Tempoh Penyata:.*?\s(\d{2})$", first_page_text, re.MULTILINE)
         year_val = "20" + year_match.group(1) if year_match else "2024"
 
@@ -97,18 +99,17 @@ def parse_transactions_rhb(pdf, source_filename):
                 
                 date_raw = line[0]['text']
                 desc_upper = " ".join([w['text'].upper() for w in line])
-                if "B/F BALANCE" in desc_upper or "C/F BALANCE" in desc_upper: continue [cite: 52, 113]
+                if "B/F BALANCE" in desc_upper or "C/F BALANCE" in desc_upper: continue
 
-                # Map specific X-axis positions for Azlan Boutique layout 
-                # Debit ~300-400, Credit ~400-500, Balance ~500+
+                # Position-based column detection for Debit/Credit/Balance
                 debit = credit = balance = 0.0
                 for w in line:
                     if MONEY_RE.match(w['text']):
                         x = w['x0']
                         val = parse_money(w['text'])
-                        if x > 510: balance = val
-                        elif 410 < x <= 510: credit = val
-                        elif 310 < x <= 410: debit = val
+                        if x > 500: balance = val # Balance column [cite: 52]
+                        elif 410 < x <= 500: credit = val # Credit column [cite: 52]
+                        elif 320 < x <= 410: debit = val # Debit column [cite: 52]
 
                 try:
                     date_iso = datetime.strptime(f"{date_raw} {year_val}", "%d %b %Y").strftime("%Y-%m-%d")
