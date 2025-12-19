@@ -1,120 +1,79 @@
 import re
 from datetime import datetime
 
-def parse_transactions_rhb(pdf, source_filename):
-    # ---------------- REGEX & HELPERS ----------------
-    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
-    REFLEX_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    CURRENT_DATE_RE = re.compile(r"^\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$")
+def parse_transactions_rhb(pdf, source_file):
+    transactions = []
+    bank_name = "RHB Bank"
 
-    def parse_money(t: str) -> float:
-        if not t: return 0.0
-        t = t.strip()
-        neg = t.endswith("-")
-        clean_t = t[:-1] if neg or t.endswith("+") else t
-        try:
-            v = float(clean_t.replace(",", ""))
-            return -v if neg else v
-        except ValueError: return 0.0
+    # Example date format: "07 Mar"
+    date_pattern = re.compile(r"^(\d{2}\s[A-Za-z]{3})")
 
-    # ---------------- FORMAT DETECTION ----------------
-    first_page_text = pdf.pages[0].extract_text()
-    # Check for "Reflex" keywords [cite: 7, 15]
-    is_reflex = "REFLEX" in first_page_text.upper() or "21413800157991" in first_page_text
+    for page_number, page in enumerate(pdf.pages, start=1):
+        text = page.extract_text()
+        if not text:
+            continue
 
-    # =========================================================================
-    # OPTION 1: REFLEX FORMAT (e.g., Clear Water Services)
-    # =========================================================================
-    if is_reflex:
-        opening_balance = None
-        words = pdf.pages[0].extract_words()
-        words.sort(key=lambda w: (round(w['top'], 1), w['x0']))
-        
-        for i, w in enumerate(words):
-            if "BEGINNING" in w['text'].upper():
-                context = " ".join([word['text'].upper() for word in words[i:i+5]])
-                if "BEGINNING BALANCE" in context:
-                    for search_idx in range(i, min(i + 15, len(words))):
-                        if MONEY_RE.match(words[search_idx]['text']):
-                            opening_balance = parse_money(words[search_idx]['text']) # [cite: 17, 18]
-                            break
-                    if opening_balance is not None: break
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-        transactions = []
-        previous_balance = opening_balance
-        for page in pdf.pages:
-            page_words = page.extract_words()
-            lines = {}
-            for w in page_words:
-                y = round(w['top'], 1)
-                lines.setdefault(y, []).append(w)
-            
-            for y in sorted(lines.keys()):
-                line = sorted(lines[y], key=lambda w: w['x0'])
-                if not line or not REFLEX_DATE_RE.match(line[0]['text'].strip()): continue
-                
-                date_iso = datetime.strptime(line[0]['text'].strip(), "%d-%m-%Y").strftime("%Y-%m-%d")
-                money_vals = [w for w in line if MONEY_RE.match(w['text'])]
-                desc = " ".join([w['text'] for w in line if not MONEY_RE.match(w['text']) and not REFLEX_DATE_RE.match(w['text'])])
-                
-                if not money_vals: continue
-                balance = parse_money(max(money_vals, key=lambda m: m['x0'])['text'])
-                
-                debit = credit = 0.0
-                if previous_balance is not None:
-                    delta = round(balance - previous_balance, 2)
-                    if delta > 0: credit = delta
-                    elif delta < 0: debit = abs(delta)
+        current_tx = None
 
-                transactions.append({
-                    "date": date_iso, "description": desc[:200], "debit": round(debit, 2),
-                    "credit": round(credit, 2), "balance": round(balance, 2),
-                    "page": page.page_number, "bank": "RHB Bank (Reflex)", "source_file": source_filename
-                })
-                previous_balance = balance
-        return transactions
+        for line in lines:
+            # Skip table headers and summaries
+            if any(x in line for x in [
+                "ACCOUNT ACTIVITY", "Date", "Tarikh", "Debit", "Credit",
+                "Balance", "B/F BALANCE", "C/F BALANCE", "Total Count"
+            ]):
+                continue
 
-    # =========================================================================
-    # OPTION 2: CURRENT ACCOUNT FORMAT (e.g., Azlan Boutique)
-    # =========================================================================
-    else:
-        # Detect year from header (e.g., "7 Mar 24" -> "2024") [cite: 36]
-        year_match = re.search(r"Tempoh Penyata:.*?\s(\d{2})$", first_page_text, re.MULTILINE)
-        year_val = "20" + year_match.group(1) if year_match else "2024"
+            # Check if line starts with a date (new transaction)
+            date_match = date_pattern.match(line)
 
-        transactions = []
-        for page in pdf.pages:
-            page_words = page.extract_words()
-            lines = {}
-            for w in page_words:
-                y = round(w['top'], 1)
-                lines.setdefault(y, []).append(w)
-            
-            for y in sorted(lines.keys()):
-                line = sorted(lines[y], key=lambda w: w['x0'])
-                if not line or not CURRENT_DATE_RE.match(line[0]['text']): continue
-                
-                date_raw = line[0]['text']
-                desc_upper = " ".join([w['text'].upper() for w in line])
-                if "B/F BALANCE" in desc_upper or "C/F BALANCE" in desc_upper: continue # 
+            if date_match:
+                # Save previous transaction
+                if current_tx:
+                    transactions.append(current_tx)
 
-                # Map specific X-axis positions for Azlan Boutique layout 
-                debit = credit = balance = 0.0
-                for w in line:
-                    if MONEY_RE.match(w['text']):
-                        x = w['x0']
-                        val = parse_money(w['text'])
-                        if x > 500: balance = val # Balance column 
-                        elif 410 < x <= 500: credit = val # Credit column 
-                        elif 320 < x <= 410: debit = val # Debit column 
+                # Split amounts from right side
+                parts = line.split()
+                date_str = f"{parts[0]} {parts[1]} 2024"  # assume statement year
+                rest = " ".join(parts[2:])
 
-                try:
-                    date_iso = datetime.strptime(f"{date_raw} {year_val}", "%d %b %Y").strftime("%Y-%m-%d")
-                    transactions.append({
-                        "date": date_iso,
-                        "description": " ".join([w['text'] for w in line if not MONEY_RE.match(w['text']) and not CURRENT_DATE_RE.match(w['text'])])[:200],
-                        "debit": abs(debit), "credit": abs(credit), "balance": balance,
-                        "page": page.page_number, "bank": "RHB Bank (Current)", "source_file": source_filename
-                    })
-                except: continue
-        return transactions
+                # Extract amounts (from right)
+                amounts = re.findall(r"[\d,]+\.\d{2}", rest)
+                debit = credit = balance = None
+
+                if len(amounts) >= 1:
+                    balance = amounts[-1].replace(",", "")
+                if len(amounts) == 2:
+                    credit = amounts[0].replace(",", "")
+                if len(amounts) >= 3:
+                    debit = amounts[0].replace(",", "")
+                    credit = amounts[1].replace(",", "")
+
+                # Clean description
+                desc = rest
+                for amt in amounts:
+                    desc = desc.replace(amt, "")
+                desc = desc.strip()
+
+                current_tx = {
+                    "date": date_str,
+                    "description": desc,
+                    "debit": float(debit) if debit else 0.0,
+                    "credit": float(credit) if credit else 0.0,
+                    "balance": float(balance) if balance else None,
+                    "page": page_number,
+                    "bank": bank_name,
+                    "source_file": source_file
+                }
+
+            else:
+                # Continuation of description
+                if current_tx:
+                    current_tx["description"] += " " + line
+
+        # Append last transaction on page
+        if current_tx:
+            transactions.append(current_tx)
+
+    return transactions
