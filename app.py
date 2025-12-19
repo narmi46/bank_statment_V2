@@ -124,12 +124,9 @@ if uploaded_files and st.session_state.status == "running":
 
                 elif bank_choice == "Public Bank (PBB)":
                     tx = parse_transactions_pbb(pdf, uploaded_file.name)
-
+                    
                 elif bank_choice == "RHB Bank":
-                    tx = parse_transactions_rhb(uploaded_file, uploaded_file.name)
-
-                #elif bank_choice == "RHB Bank":
-                #    tx = parse_transactions_rhb(pdf, uploaded_file.name)
+                    tx = parse_transactions_rhb(pdf, uploaded_file.name)
 
                 elif bank_choice == "CIMB Bank":
                     tx = parse_transactions_cimb(pdf, uploaded_file.name)
