@@ -1,154 +1,298 @@
-import re
+import streamlit as st
+import pdfplumber
+import json
+import pandas as pd
 from datetime import datetime
+from io import BytesIO
 
-def parse_transactions_rhb(pdf, source_filename):
-    """
-    Detects and parses two distinct RHB statement formats:
-    1. 'Reflex' (Cash Management) - Uses coordinate-based line grouping.
-    2. 'Current Account' (Standard) - Uses table extraction strategy.
-    """
-    # ---------------- COMMON REGEX & HELPERS ----------------
-    MONEY_RE = re.compile(r"^\d{1,3}(?:,\d{3})*\.\d{2}[+-]?$")
-    REFLEX_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    CURRENT_DATE_RE = re.compile(r"^\d{2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$")
+# ---------------------------------------------------
+# Import standalone parsers (EXISTING)
+# ---------------------------------------------------
+from maybank import parse_transactions_maybank
+from public_bank import parse_transactions_pbb
+from rhb_adapter import parse_transactions_rhb
+from cimb import parse_transactions_cimb
+from bank_islam import parse_bank_islam
+from bank_rakyat import parse_bank_rakyat
 
-    def parse_money(t: str) -> float:
-        if not t: return 0.0
-        t = t.strip()
-        neg = t.endswith("-")
-        clean_t = t[:-1] if neg or t.endswith("+") else t
+# ---------------------------------------------------
+# NEW BANK PARSERS (ADDED ONLY)
+# ---------------------------------------------------
+
+from bank_muamalat import parse_transactions_bank_muamalat
+
+
+# ---------------------------------------------------
+# Streamlit Setup
+# ---------------------------------------------------
+st.set_page_config(page_title="Bank Statement Parser", layout="wide")
+st.title("📄 Bank Statement Parser (Multi-File Support)")
+st.write("Upload one or more bank statement PDFs to extract transactions.")
+
+
+# ---------------------------------------------------
+# Session State
+# ---------------------------------------------------
+if "status" not in st.session_state:
+    st.session_state.status = "idle"    # idle, running, stopped
+
+if "results" not in st.session_state:
+    st.session_state.results = []
+
+
+# ---------------------------------------------------
+# Bank Selection
+# ---------------------------------------------------
+bank_choice = st.selectbox(
+    "Select Bank Format",
+    [
+        "Maybank",
+        "Public Bank (PBB)",
+        "RHB Bank",
+        "CIMB Bank",
+        "Bank Islam",
+        "Bank Rakyat",       # ✅ NEW
+        "Bank Muamalat"      # ✅ NEW
+    ]
+)
+
+
+# ---------------------------------------------------
+# File Upload
+# ---------------------------------------------------
+uploaded_files = st.file_uploader(
+    "Upload PDF files",
+    type=["pdf"],
+    accept_multiple_files=True
+)
+
+# Sort uploaded files by name
+if uploaded_files:
+    uploaded_files = sorted(uploaded_files, key=lambda x: x.name)
+
+
+# ---------------------------------------------------
+# Start / Stop / Reset Controls
+# ---------------------------------------------------
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    if st.button("▶️ Start Processing"):
+        st.session_state.status = "running"
+
+with col2:
+    if st.button("⏹️ Stop"):
+        st.session_state.status = "stopped"
+
+with col3:
+    if st.button("🔄 Reset"):
+        st.session_state.status = "idle"
+        st.session_state.results = []
+        st.rerun()
+
+st.write(f"### ⚙️ Status: **{st.session_state.status.upper()}**")
+
+
+# ---------------------------------------------------
+# MAIN PROCESSING
+# ---------------------------------------------------
+all_tx = []
+
+if uploaded_files and st.session_state.status == "running":
+
+    bank_display_box = st.empty()
+    progress_bar = st.progress(0)
+
+    total_files = len(uploaded_files)
+
+    for file_idx, uploaded_file in enumerate(uploaded_files):
+
+        if st.session_state.status == "stopped":
+            st.warning("⏹️ Processing stopped by user.")
+            break
+
+        st.write(f"### 🗂️ Processing File: **{uploaded_file.name}**")
+        bank_display_box.info(f"📄 Processing {bank_choice}: {uploaded_file.name}...")
+
         try:
-            v = float(clean_t.replace(",", ""))
-            return -v if neg else v
-        except ValueError:
-            return 0.0
+            with pdfplumber.open(uploaded_file) as pdf:
 
-    # ---------------- FORMAT DETECTION ----------------
-    first_page_text = pdf.pages[0].extract_text()
-    # Check for keywords specific to the 'Reflex' format
-    is_reflex = "REFLEX" in first_page_text.upper() or "21413800157991" in first_page_text
+                tx = []
 
-    # =========================================================================
-    # OPTION 1: REFLEX CASH MANAGEMENT FORMAT (e.g., Clear Water Services)
-    # =========================================================================
-    if is_reflex:
-        opening_balance = None
-        words = pdf.pages[0].extract_words()
-        words.sort(key=lambda w: (round(w['top'], 1), w['x0']))
+                if bank_choice == "Maybank":
+                    tx = parse_transactions_maybank(pdf, uploaded_file.name)
 
-        # Anchor search for Beginning Balance
-        for i, w in enumerate(words):
-            if "BEGINNING" in w['text'].upper():
-                context = " ".join([word['text'].upper() for word in words[i:i+5]])
-                if "BEGINNING BALANCE" in context:
-                    for search_idx in range(i, min(i + 15, len(words))):
-                        if MONEY_RE.match(words[search_idx]['text']):
-                            opening_balance = parse_money(words[search_idx]['text'])
-                            break
-                    if opening_balance is not None: break
+                elif bank_choice == "Public Bank (PBB)":
+                    tx = parse_transactions_pbb(pdf, uploaded_file.name)
 
-        transactions = []
-        previous_balance = opening_balance
-        
-        for page in pdf.pages:
-            page_words = page.extract_words()
-            lines_dict = {}
-            for w in page_words:
-                y = round(w['top'], 1)
-                lines_dict.setdefault(y, []).append(w)
-            
-            for y in sorted(lines_dict.keys()):
-                line = sorted(lines_dict[y], key=lambda w: w['x0'])
-                if not line or not REFLEX_DATE_RE.match(line[0]['text'].strip()): 
-                    continue
-                
-                date_iso = datetime.strptime(line[0]['text'].strip(), "%d-%m-%Y").strftime("%Y-%m-%d")
-                
-                # Extract description and money values
-                desc_parts = []
-                money_vals = []
-                for w in line[1:]:
-                    txt = w['text'].strip()
-                    if MONEY_RE.match(txt):
-                        money_vals.append(w)
-                    elif not txt.isdigit():
-                        desc_parts.append(txt)
-                
-                if not money_vals: continue
-                
-                # Rightmost money is always the balance
-                balance = parse_money(max(money_vals, key=lambda m: m['x0'])['text'])
-                
-                # Calculate movement based on balance change
-                debit = credit = 0.0
-                if previous_balance is not None:
-                    delta = round(balance - previous_balance, 2)
-                    if delta > 0: credit = delta
-                    elif delta < 0: debit = abs(delta)
+                elif bank_choice == "RHB Bank":
+                    tx = parse_transactions_rhb(pdf, uploaded_file.name)
 
-                transactions.append({
-                    "date": date_iso,
-                    "description": " ".join(desc_parts)[:200],
-                    "debit": round(debit, 2),
-                    "credit": round(credit, 2),
-                    "balance": round(balance, 2),
-                    "page": page.page_number,
-                    "bank": "RHB Bank (Reflex)",
-                    "source_file": source_filename
-                })
-                previous_balance = balance
-        return transactions
+                elif bank_choice == "CIMB Bank":
+                    tx = parse_transactions_cimb(pdf, uploaded_file.name)
 
-    # =========================================================================
-    # OPTION 2: ORDINARY CURRENT ACCOUNT FORMAT (e.g., Azlan Boutique)
-    # =========================================================================
-    else:
-        # Improved Year Detection: Looks for '7 Mar 24' or similar in the header
-        year_val = "2024" 
-        header_match = re.search(r"Tempoh Penyata:\s+\d{1,2}\s+\w{3}\s+(\d{2})", first_page_text)
-        if header_match:
-            year_val = "20" + header_match.group(1)
+                elif bank_choice == "Bank Islam":
+                    tx = parse_bank_islam(pdf, uploaded_file.name)
 
-        transactions = []
-        for page in pdf.pages:
-            # Using a more robust table extraction setting for grid layouts
-            table = page.extract_table({
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "lines",
-                "intersection_y_tolerance": 10 # Helps catch multi-line descriptions
-            })
-            
-            if not table: continue
-            
-            for row in table:
-                # Filter out None/empty and strip whitespace
-                row = [str(c).strip() if c else "" for c in row]
-                
-                # Check for the date format "07 Mar" [cite: 52]
-                if len(row) < 6 or not CURRENT_DATE_RE.match(row[0]): 
-                    continue
-                
-                # Skip summary lines [cite: 52, 113]
-                desc_upper = row[1].upper()
-                if any(x in desc_upper for x in ["B/F BALANCE", "C/F BALANCE", "TOTAL COUNT"]):
-                    continue
-                
-                try:
-                    # Normalize date using detected year 
-                    date_obj = datetime.strptime(f"{row[0]} {year_val}", "%d %b %Y")
-                    date_iso = date_obj.strftime("%Y-%m-%d")
-                    
-                    transactions.append({
-                        "date": date_iso,
-                        "description": row[1].replace("\n", " ")[:200],
-                        "debit": parse_money(row[3]), # [cite: 52]
-                        "credit": parse_money(row[4]), # [cite: 52]
-                        "balance": parse_money(row[5]), # [cite: 52]
-                        "page": page.page_number,
-                        "bank": "RHB Bank (Current)",
-                        "source_file": source_filename
-                    })
-                except Exception:
-                    continue
-                    
-        return transactions
+                elif bank_choice == "Bank Rakyat":
+                    tx = parse_bank_rakyat(pdf, uploaded_file.name)
+
+                # ---------------------------------------------------
+                # NEW BANKS (ADDED ONLY)
+                # ---------------------------------------------------
+    
+                elif bank_choice == "Bank Muamalat":
+                    tx = parse_transactions_bank_muamalat(pdf, uploaded_file.name)
+
+                if tx:
+                    st.success(f"✅ Extracted {len(tx)} transactions from {uploaded_file.name}")
+                    all_tx.extend(tx)
+                else:
+                    st.warning(f"⚠️ No transactions found in {uploaded_file.name}")
+
+        except Exception as e:
+            st.error(f"❌ Error processing {uploaded_file.name}: {e}")
+
+        progress = (file_idx + 1) / total_files
+        progress_bar.progress(progress)
+
+    bank_display_box.success(f"🏦 Completed processing: **{bank_choice}**")
+    st.session_state.results = all_tx
+
+
+# ---------------------------------------------------
+# CALCULATE MONTHLY SUMMARY
+# ---------------------------------------------------
+def calculate_monthly_summary(transactions):
+    if not transactions:
+        return []
+
+    df = pd.DataFrame(transactions)
+
+    df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date_parsed'])
+
+    if df.empty:
+        st.warning("⚠️ No valid transaction dates found.")
+        return []
+
+    df['month_period'] = df['date_parsed'].dt.strftime('%Y-%m')
+
+    df['debit'] = pd.to_numeric(df['debit'], errors='coerce').fillna(0)
+    df['credit'] = pd.to_numeric(df['credit'], errors='coerce').fillna(0)
+    df['balance'] = pd.to_numeric(df['balance'], errors='coerce')
+
+    monthly_summary = []
+
+    for period, group in df.groupby('month_period', sort=True):
+
+        ending_balance = None
+        if not group['balance'].isna().all():
+            group_sorted = group.sort_values('date_parsed')
+            balances = group_sorted['balance'].dropna()
+            if not balances.empty:
+                ending_balance = round(balances.iloc[-1], 2)
+
+        monthly_summary.append({
+            'month': period,
+            'transaction_count': len(group),
+            'total_debit': round(group['debit'].sum(), 2),
+            'total_credit': round(group['credit'].sum(), 2),
+            'net_change': round(group['credit'].sum() - group['debit'].sum(), 2),
+            'ending_balance': ending_balance,
+            'lowest_balance': round(group['balance'].min(), 2) if not group['balance'].isna().all() else None,
+            'highest_balance': round(group['balance'].max(), 2) if not group['balance'].isna().all() else None,
+            'source_files': ', '.join(sorted(group['source_file'].unique())) if 'source_file' in group.columns else ''
+        })
+
+    return sorted(monthly_summary, key=lambda x: x['month'])
+
+
+# ---------------------------------------------------
+# DISPLAY RESULTS
+# ---------------------------------------------------
+if st.session_state.results:
+
+    st.subheader("📊 Extracted Transactions")
+
+    df = pd.DataFrame(st.session_state.results)
+
+    display_cols = [
+        "date", "description", "debit", "credit",
+        "balance", "page", "bank", "source_file"
+    ]
+    display_cols = [c for c in display_cols if c in df.columns]
+
+    df_display = df[display_cols]
+    st.dataframe(df_display, use_container_width=True)
+
+    monthly_summary = calculate_monthly_summary(st.session_state.results)
+
+    if monthly_summary:
+        st.subheader("📅 Monthly Summary")
+        summary_df = pd.DataFrame(monthly_summary)
+        st.dataframe(summary_df, use_container_width=True)
+
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("Total Transactions", summary_df['transaction_count'].sum())
+        with col2:
+            st.metric("Total Debits", f"RM {summary_df['total_debit'].sum():,.2f}")
+        with col3:
+            st.metric("Total Credits", f"RM {summary_df['total_credit'].sum():,.2f}")
+        with col4:
+            net_total = summary_df['net_change'].sum()
+            st.metric("Net Change", f"RM {net_total:,.2f}")
+
+    # ---------------------------------------------------
+    # DOWNLOAD OPTIONS
+    # ---------------------------------------------------
+    st.subheader("⬇️ Download Options")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.download_button(
+            "📄 Download Transactions (JSON)",
+            json.dumps(df_display.to_dict(orient="records"), indent=4),
+            "transactions.json",
+            "application/json"
+        )
+
+    with col2:
+        full_report = {
+            "summary": {
+                "total_transactions": len(df),
+                "date_range": f"{df['date'].min()} to {df['date'].max()}",
+                "total_files_processed": df['source_file'].nunique()
+            },
+            "monthly_summary": monthly_summary,
+            "transactions": df_display.to_dict(orient="records")
+        }
+        st.download_button(
+            "📊 Download Full Report (JSON)",
+            json.dumps(full_report, indent=4),
+            "full_report.json",
+            "application/json"
+        )
+
+    with col3:
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df_display.to_excel(writer, sheet_name="Transactions", index=False)
+            if monthly_summary:
+                pd.DataFrame(monthly_summary).to_excel(
+                    writer, sheet_name="Monthly Summary", index=False
+                )
+
+        st.download_button(
+            "📊 Download Full Report (XLSX)",
+            output.getvalue(),
+            "full_report.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+else:
+    if uploaded_files:
+        st.warning("⚠️ No transactions found — click **Start Processing**.")
