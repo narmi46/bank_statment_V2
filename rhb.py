@@ -201,9 +201,6 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         used_y = set()
 
         for r in rows:
-            # -------------------------------
-            # Identify transaction row by DATE
-            # -------------------------------
             if not DATE_RE.match(r["text"]):
                 continue
 
@@ -211,42 +208,31 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if y in used_y:
                 continue
 
-            # Collect entire visual row
             line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
-            # Collect monetary columns IN ORDER
             money = [w for w in line if MONEY_RE.match(w["text"])]
 
-            # RHB Reflex rows always have:
-            # [DR or -, CR or -, BALANCE]
-            if len(money) < 3:
+            # ✅ FIX: Reflex rows have 2 money values
+            if len(money) < 2:
                 continue
 
-            dr_word = money[0]
-            cr_word = money[1]
+            txn_word = money[0]
             bal_word = money[-1]
 
-            # -------------------------------
-            # Balance (overdraft safe)
-            # -------------------------------
+            amt = float(txn_word["text"].replace(",", ""))
+
             bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
             if bal_word["text"].endswith("-"):
                 bal_val = -bal_val
 
-            # -------------------------------
-            # Debit / Credit — COLUMN POPULATION ONLY
-            # -------------------------------
+            # DR / CR by column population
             debit = credit = 0.0
+            if txn_word["x"] < bal_word["x"]:
+                debit = amt
+            else:
+                credit = amt
 
-            if MONEY_RE.match(dr_word["text"]) and dr_word["text"] != "-":
-                debit = float(dr_word["text"].replace(",", ""))
-            elif MONEY_RE.match(cr_word["text"]) and cr_word["text"] != "-":
-                credit = float(cr_word["text"].replace(",", ""))
-
-            # -------------------------------
-            # Description
-            # -------------------------------
             description = [
                 w["text"] for w in line
                 if w not in money
@@ -258,17 +244,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "date": norm_date(r["text"]),
                 "description": " ".join(description)[:200],
                 "debit": round(debit, 2),
-                "credit": round(credit, 2),
-                "balance": round(bal_val, 2),
-                "page": page_index + 1,
-                "bank": "RHB Bank",
-                "source_file": source_filename
-            })
 
-            used_y.add(y)
-
-    doc.close()
-    return transactions
 
 
 # ======================================================
