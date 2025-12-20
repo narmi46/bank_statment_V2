@@ -104,6 +104,7 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
 # ======================================================
 # 2️⃣ RHB CONVENTIONAL — TEXT BASED (UNCHANGED)
 # ======================================================
+
 def _parse_rhb_conventional_text(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
@@ -177,17 +178,32 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     def parse_money(t):
         neg = t.endswith("-")
-        pos = t.endswith("+")
-        t = t[:-1] if neg or pos else t
+        t = t[:-1] if t.endswith(("-", "+")) else t
         v = float(t.replace(",", ""))
         return -v if neg else v
 
     def norm_date(t):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    previous_balance = None
-    first_txn = True
+    # --------------------------------------------------
+    # 1️⃣ Extract BEGINNING BALANCE from summary (page 1)
+    # --------------------------------------------------
+    opening_balance = None
+    first_page = doc[0]
+    for w in first_page.get_text("words"):
+        if w[4].strip().endswith("-") and "," in w[4]:
+            opening_balance = parse_money(w[4].strip())
+            break
 
+    if opening_balance is None:
+        doc.close()
+        return []
+
+    previous_balance = opening_balance
+
+    # --------------------------------------------------
+    # 2️⃣ Transactions (ALL pages, DELTA-BASED)
+    # --------------------------------------------------
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
         rows = [{
@@ -203,12 +219,12 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if not DATE_RE.match(r["text"]):
                 continue
 
-            y_key = r["y"]
-            if y_key in used_y:
+            y = r["y"]
+            if y in used_y:
                 continue
 
             date_iso = norm_date(r["text"])
-            line = [w for w in rows if abs(w["y"] - y_key) <= 1.5]
+            line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
             desc = []
@@ -226,24 +242,16 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 continue
 
             balance = parse_money(max(money, key=lambda m: m["x"])["text"])
-            debit = credit = 0.0
 
-            if first_txn:
-                if len(money) >= 2:
-                    amt = parse_money(money[-2]["text"])
-                    debit = abs(amt) if amt < 0 else 0.0
-                    credit = amt if amt > 0 else 0.0
-                first_txn = False
-            elif previous_balance is not None:
-                delta = round(balance - previous_balance, 2)
-                debit = abs(delta) if delta < 0 else 0.0
-                credit = delta if delta > 0 else 0.0
+            delta = round(balance - previous_balance, 2)
+            debit = abs(delta) if delta < 0 else 0.0
+            credit = delta if delta > 0 else 0.0
 
             transactions.append({
                 "date": date_iso,
                 "description": " ".join(desc)[:200],
-                "debit": round(debit, 2),
-                "credit": round(credit, 2),
+                "debit": debit,
+                "credit": credit,
                 "balance": round(balance, 2),
                 "page": page_index + 1,
                 "bank": "RHB Bank",
@@ -251,25 +259,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             })
 
             previous_balance = balance
-            used_y.add(y_key)
+            used_y.add(y)
 
     doc.close()
     return transactions
-
-
-# ======================================================
-# 🚦 PUBLIC ENTRYPOINT (UNCHANGED)
-# ======================================================
-def parse_transactions_rhb(pdf_input, source_filename):
-    pdf_bytes = _read_pdf_bytes(pdf_input)
-
-    for parser in (
-        _parse_rhb_islamic_text,
-        _parse_rhb_conventional_text,
-        _parse_rhb_reflex_layout,
-    ):
-        tx = parser(pdf_bytes, source_filename)
-        if tx:
-            return tx
-
-    return []
