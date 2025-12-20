@@ -12,7 +12,7 @@ def _read_pdf_bytes(pdf_input):
     if isinstance(pdf_input, (bytes, bytearray)):
         return bytes(pdf_input)
 
-    if hasattr(pdf_input, "stream"):  # Streamlit UploadedFile
+    if hasattr(pdf_input, "stream"):
         pdf_input.stream.seek(0)
         return pdf_input.stream.read()
 
@@ -36,18 +36,15 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
 
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         header = pdf.pages[0].extract_text() or ""
-
         period_match = re.search(
-            r"Statement Period.*?:\s*\d{1,2}\s+"
-            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})",
+            r"Statement Period.*?(\d{2})",
             header,
             re.IGNORECASE
         )
-
         if not period_match:
             return []
 
-        year = int("20" + period_match.group(2))
+        year = int("20" + period_match.group(1))
 
         for page_index, page in enumerate(pdf.pages):
             text = page.extract_text()
@@ -79,10 +76,8 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
                 debit = abs(delta) if delta < 0 else 0.0
                 credit = delta if delta > 0 else 0.0
 
-                desc = line
-                desc = desc.replace(bal_match.group(1), "")
+                desc = re.sub(balance_re, "", line)
                 desc = desc.replace(date_match.group(0), "")
-                desc = re.sub(r"\d{1,3}(?:,\d{3})*\.\d{2}", "", desc)
                 desc = re.sub(r"\s+", " ", desc).strip()
 
                 transactions.append({
@@ -104,7 +99,6 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
 # ======================================================
 # 2️⃣ RHB CONVENTIONAL — TEXT BASED (UNCHANGED)
 # ======================================================
-
 def _parse_rhb_conventional_text(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
@@ -146,7 +140,8 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
                 debit = abs(delta) if delta < 0 else 0.0
                 credit = delta if delta > 0 else 0.0
 
-                desc = line.replace(bal.group(1), "").replace(date.group(0), "")
+                desc = re.sub(balance_re, "", line)
+                desc = desc.replace(date.group(0), "")
                 desc = re.sub(r"\s+", " ", desc).strip()
 
                 transactions.append({
@@ -166,7 +161,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX — LAYOUT BASED (FIXED)
+# 3️⃣ RHB REFLEX — LAYOUT BASED (LAYOUT = TRUTH)
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
@@ -174,38 +169,14 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    MONEY_RE = re.compile(r"^(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}[+-]?$")
-
-    def parse_money(t):
-        neg = t.endswith("-")
-        t = t[:-1] if t.endswith(("-", "+")) else t
-        v = float(t.replace(",", ""))
-        return -v if neg else v
+    MONEY_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}")
 
     def norm_date(t):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
-    # --------------------------------------------------
-    # 1️⃣ Extract BEGINNING BALANCE from summary (page 1)
-    # --------------------------------------------------
-    opening_balance = None
-    first_page = doc[0]
-    for w in first_page.get_text("words"):
-        if w[4].strip().endswith("-") and "," in w[4]:
-            opening_balance = parse_money(w[4].strip())
-            break
-
-    if opening_balance is None:
-        doc.close()
-        return []
-
-    previous_balance = opening_balance
-
-    # --------------------------------------------------
-    # 2️⃣ Transactions (ALL pages, DELTA-BASED)
-    # --------------------------------------------------
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
+
         rows = [{
             "x": w[0],
             "y": round(w[1], 1),
@@ -223,49 +194,51 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if y in used_y:
                 continue
 
-            date_iso = norm_date(r["text"])
             line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
-            desc = []
-            money = []
-
-            for w in line:
-                if w["text"] == r["text"]:
-                    continue
-                if MONEY_RE.match(w["text"]):
-                    money.append(w)
-                elif not w["text"].isdigit():
-                    desc.append(w["text"])
-
-            if not money:
+            amounts = [w["text"] for w in line if MONEY_RE.match(w["text"])]
+            if len(amounts) < 2:
                 continue
 
-            balance = parse_money(max(money, key=lambda m: m["x"])["text"])
+            balance_text = amounts[-1]
+            balance = float(balance_text.replace(",", "").replace("-", ""))
 
-            delta = round(balance - previous_balance, 2)
-            debit = abs(delta) if delta < 0 else 0.0
-            credit = delta if delta > 0 else 0.0
+            debit = credit = 0.0
+            txn_amt = float(amounts[0].replace(",", ""))
+
+            remainder = " ".join(w["text"] for w in line)
+            if " - " in remainder:
+                debit = txn_amt
+            else:
+                credit = txn_amt
+
+            description = [
+                w["text"] for w in line
+                if w["text"] not in amounts
+                and not DATE_RE.match(w["text"])
+                and not w["text"].isdigit()
+            ]
 
             transactions.append({
-                "date": date_iso,
-                "description": " ".join(desc)[:200],
-                "debit": debit,
-                "credit": credit,
-                "balance": round(balance, 2),
+                "date": norm_date(r["text"]),
+                "description": " ".join(description)[:200],
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": -balance if balance_text.endswith("-") else balance,
                 "page": page_index + 1,
                 "bank": "RHB Bank",
                 "source_file": source_filename
             })
 
-            previous_balance = balance
             used_y.add(y)
 
     doc.close()
     return transactions
 
+
 # ======================================================
-# 🚦 PUBLIC ENTRYPOINT (DO NOT RENAME)
+# 🚦 PUBLIC ENTRYPOINT — DO NOT RENAME
 # ======================================================
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
