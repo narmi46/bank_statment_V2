@@ -165,7 +165,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED (UPDATED)
+# 3️⃣ RHB REFLEX / CASH MANAGEMENT — LAYOUT BASED (FIXED)
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
@@ -174,7 +174,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
 
-    # 🔥 Updated: supports <1.00, commas, trailing +/- (overdraft)
+    # Supports: 0.50, .50, 1,425.00, trailing +/- for overdraft
     MONEY_RE = re.compile(
         r"^(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}[+-]?$"
     )
@@ -193,7 +193,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
 
     # ==================================================
-    # Opening Balance (page 1 only)
+    # Opening Balance (page 1 header)
     # ==================================================
     opening_balance = None
     first_page = doc[0]
@@ -224,6 +224,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             break
 
     previous_balance = opening_balance
+    is_first_txn = True  # 🔥 critical flag
 
     # ==================================================
     # Transactions (ALL pages)
@@ -273,7 +274,23 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             )
 
             debit = credit = 0.0
-            if previous_balance is not None:
+
+            # ==================================================
+            # 🔥 FIRST TRANSACTION — USE LAYOUT, NOT DELTA
+            # ==================================================
+            if is_first_txn:
+                if len(money_vals) >= 2:
+                    txn_amt = parse_money(money_vals[-2]["text"])
+                    if txn_amt < 0:
+                        debit = abs(txn_amt)
+                    else:
+                        credit = txn_amt
+                is_first_txn = False
+
+            # ==================================================
+            # ALL OTHER TRANSACTIONS — SAFE DELTA
+            # ==================================================
+            elif previous_balance is not None:
                 delta = round(balance - previous_balance, 2)
                 if delta > 0:
                     credit = delta
