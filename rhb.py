@@ -185,6 +185,22 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         } for w in words if w[4].strip()]
 
         rows.sort(key=lambda r: (r["y"], r["x"]))
+
+        # --------------------------------------------------
+        # 1️⃣ Detect DR / CR column positions from header
+        # --------------------------------------------------
+        dr_x = cr_x = None
+        for r in rows:
+            t = r["text"].upper()
+            if t == "DR" or "AMOUNT (DR)" in t:
+                dr_x = r["x"]
+            elif t == "CR" or "AMOUNT (CR)" in t:
+                cr_x = r["x"]
+
+        # If header not found, skip page safely
+        if dr_x is None or cr_x is None:
+            continue
+
         used_y = set()
 
         for r in rows:
@@ -216,9 +232,12 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
             amt = float(txn_word["text"].replace(",", ""))
 
-            # COLUMN DECISION (this is the fix)
+            # --------------------------------------------------
+            # 2️⃣ DR / CR DECISION — PURE COLUMN LOGIC
+            # --------------------------------------------------
             debit = credit = 0.0
-            if txn_word["x"] < (bal_word["x"] - 50):
+
+            if abs(txn_word["x"] - dr_x) < abs(txn_word["x"] - cr_x):
                 debit = amt
             else:
                 credit = amt
@@ -245,7 +264,6 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     doc.close()
     return transactions
-
 
 
 # ======================================================
