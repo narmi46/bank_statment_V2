@@ -244,6 +244,17 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "date": norm_date(r["text"]),
                 "description": " ".join(description)[:200],
                 "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(bal_val, 2),
+                "page": page_index + 1,
+                "bank": "RHB Bank",
+                "source_file": source_filename
+            })
+
+            used_y.add(y)
+
+    doc.close()
+    return transactions
 
 
 
