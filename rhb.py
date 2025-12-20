@@ -6,22 +6,36 @@ from io import BytesIO
 
 
 # ======================================================
-# Helper: read PDF bytes safely
+# Helper: read PDF bytes safely (STREAMLIT SAFE)
 # ======================================================
 def _read_pdf_bytes(pdf_input):
+    # Case 1: already raw bytes
     if isinstance(pdf_input, (bytes, bytearray)):
         return bytes(pdf_input)
 
-    if hasattr(pdf_input, "stream"):
-        pdf_input.stream.seek(0)
-        return pdf_input.stream.read()
+    # Case 2: Streamlit UploadedFile (CRITICAL FIX)
+    if hasattr(pdf_input, "getvalue"):
+        data = pdf_input.getvalue()
+        if data:
+            return data
 
+    # Case 3: generic file-like object
     if hasattr(pdf_input, "read"):
-        pdf_input.seek(0)
-        return pdf_input.read()
+        try:
+            pdf_input.seek(0)
+        except Exception:
+            pass
 
-    with open(pdf_input, "rb") as f:
-        return f.read()
+        data = pdf_input.read()
+        if data:
+            return data
+
+    # Case 4: file path
+    if isinstance(pdf_input, str):
+        with open(pdf_input, "rb") as f:
+            return f.read()
+
+    raise ValueError("Unable to read PDF bytes")
 
 
 # ======================================================
@@ -161,9 +175,8 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX — LAYOUT BASED (LAYOUT = TRUTH)
+# 3️⃣ RHB REFLEX — LAYOUT BASED (YOUR LOGIC, FIXED)
 # ======================================================
-
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
 
@@ -185,22 +198,6 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         } for w in words if w[4].strip()]
 
         rows.sort(key=lambda r: (r["y"], r["x"]))
-
-        # --------------------------------------------------
-        # 1️⃣ Detect DR / CR column positions from header
-        # --------------------------------------------------
-        dr_x = cr_x = None
-        for r in rows:
-            t = r["text"].upper()
-            if t == "DR" or "AMOUNT (DR)" in t:
-                dr_x = r["x"]
-            elif t == "CR" or "AMOUNT (CR)" in t:
-                cr_x = r["x"]
-
-        # If header not found, skip page safely
-        if dr_x is None or cr_x is None:
-            continue
-
         used_y = set()
 
         for r in rows:
@@ -218,13 +215,11 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if len(money) < 2:
                 continue
 
-            # balance = rightmost money
             bal_word = max(money, key=lambda m: m["x"])
             bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
             if bal_word["text"].endswith("-"):
                 bal_val = -bal_val
 
-            # transaction amount = money just left of balance
             txn_word = sorted(
                 [m for m in money if m["x"] < bal_word["x"]],
                 key=lambda m: m["x"]
@@ -232,12 +227,9 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
             amt = float(txn_word["text"].replace(",", ""))
 
-            # --------------------------------------------------
-            # 2️⃣ DR / CR DECISION — PURE COLUMN LOGIC
-            # --------------------------------------------------
+            # --- LAYOUT TRUTH: POSITION RELATIVE TO BALANCE ---
             debit = credit = 0.0
-
-            if abs(txn_word["x"] - dr_x) < abs(txn_word["x"] - cr_x):
+            if txn_word["x"] < bal_word["x"]:
                 debit = amt
             else:
                 credit = amt
@@ -267,7 +259,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 🚦 PUBLIC ENTRYPOINT — DO NOT RENAME
+# 🚦 PUBLIC ENTRYPOINT (DO NOT RENAME)
 # ======================================================
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
