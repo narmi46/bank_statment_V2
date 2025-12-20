@@ -194,30 +194,42 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if y in used_y:
                 continue
 
+            # collect full visual row
             line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
-            amounts = [w["text"] for w in line if MONEY_RE.match(w["text"])]
+            texts = [w["text"] for w in line]
+
+            amounts = [t for t in texts if MONEY_RE.match(t)]
             if len(amounts) < 2:
                 continue
 
+            # last amount is always balance
             balance_text = amounts[-1]
             balance = float(balance_text.replace(",", "").replace("-", ""))
+            if balance_text.endswith("-"):
+                balance = -balance
+
+            # transaction amount is the first amount
+            amt = float(amounts[0].replace(",", ""))
+
+            # layout-based DR / CR decision (POSITIONAL)
+            remainder = " ".join(texts)
+            before_amt, _ = remainder.split(amounts[0], 1)
 
             debit = credit = 0.0
-            txn_amt = float(amounts[0].replace(",", ""))
-
-            remainder = " ".join(w["text"] for w in line)
-            if " - " in remainder:
-                debit = txn_amt
+            if "-" in before_amt:
+                # "- 30,000.00" → CREDIT
+                credit = amt
             else:
-                credit = txn_amt
+                # "27,286.00 -" → DEBIT
+                debit = amt
 
             description = [
-                w["text"] for w in line
-                if w["text"] not in amounts
-                and not DATE_RE.match(w["text"])
-                and not w["text"].isdigit()
+                t for t in texts
+                if t not in amounts
+                and not DATE_RE.match(t)
+                and not t.isdigit()
             ]
 
             transactions.append({
@@ -225,7 +237,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "description": " ".join(description)[:200],
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
-                "balance": -balance if balance_text.endswith("-") else balance,
+                "balance": round(balance, 2),
                 "page": page_index + 1,
                 "bank": "RHB Bank",
                 "source_file": source_filename
