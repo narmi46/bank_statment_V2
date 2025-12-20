@@ -163,6 +163,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 # ======================================================
 # 3️⃣ RHB REFLEX — LAYOUT BASED (LAYOUT = TRUTH)
 # ======================================================
+
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
 
@@ -194,42 +195,39 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if y in used_y:
                 continue
 
-            # collect full visual row
             line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
 
-            texts = [w["text"] for w in line]
-
-            amounts = [t for t in texts if MONEY_RE.match(t)]
-            if len(amounts) < 2:
+            money = [w for w in line if MONEY_RE.match(w["text"])]
+            if len(money) < 2:
                 continue
 
-            # last amount is always balance
-            balance_text = amounts[-1]
-            balance = float(balance_text.replace(",", "").replace("-", ""))
-            if balance_text.endswith("-"):
-                balance = -balance
+            # balance = rightmost money
+            bal_word = max(money, key=lambda m: m["x"])
+            bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
+            if bal_word["text"].endswith("-"):
+                bal_val = -bal_val
 
-            # transaction amount is the first amount
-            amt = float(amounts[0].replace(",", ""))
+            # transaction amount = money just left of balance
+            txn_word = sorted(
+                [m for m in money if m["x"] < bal_word["x"]],
+                key=lambda m: m["x"]
+            )[-1]
 
-            # layout-based DR / CR decision (POSITIONAL)
-            remainder = " ".join(texts)
-            before_amt, _ = remainder.split(amounts[0], 1)
+            amt = float(txn_word["text"].replace(",", ""))
 
+            # COLUMN DECISION (this is the fix)
             debit = credit = 0.0
-            if "-" in before_amt:
-                # "- 30,000.00" → CREDIT
-                credit = amt
-            else:
-                # "27,286.00 -" → DEBIT
+            if txn_word["x"] < (bal_word["x"] - 50):
                 debit = amt
+            else:
+                credit = amt
 
             description = [
-                t for t in texts
-                if t not in amounts
-                and not DATE_RE.match(t)
-                and not t.isdigit()
+                w["text"] for w in line
+                if w not in money
+                and not DATE_RE.match(w["text"])
+                and not w["text"].isdigit()
             ]
 
             transactions.append({
@@ -237,7 +235,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "description": " ".join(description)[:200],
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
-                "balance": round(balance, 2),
+                "balance": round(bal_val, 2),
                 "page": page_index + 1,
                 "bank": "RHB Bank",
                 "source_file": source_filename
@@ -247,6 +245,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     doc.close()
     return transactions
+
 
 
 # ======================================================
