@@ -1,5 +1,7 @@
-# cimb.py - Standalone CIMB Bank Parser
+# cimb.py - Standalone CIMB Bank Parser (BANK-GRADE)
+
 import re
+from datetime import datetime
 
 # ---------------------------------------------------------
 # YEAR EXTRACTION
@@ -10,178 +12,205 @@ def extract_year_from_text(text):
     Extract year from CIMB Bank statement.
     Handles both 4-digit (2024) and 2-digit (24) year formats.
     """
-    # Try specific patterns first (most reliable)
-    
+    if not text:
+        return None
+
     # Pattern 1: STATEMENT DATE : 30/09/24
-    match = re.search(r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})', text, re.IGNORECASE)
+    match = re.search(
+        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
+        text,
+        re.IGNORECASE
+    )
     if match:
-        year_str = match.group(1)
-        if len(year_str) == 4:
-            return year_str
-        elif len(year_str) == 2:
-            return str(2000 + int(year_str))
-    
+        year = match.group(1)
+        return year if len(year) == 4 else str(2000 + int(year))
+
     # Pattern 2: Statement Date: DD/MM/YYYY
-    match = re.search(r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}/\d{1,2}/(\d{4})', text, re.IGNORECASE)
+    match = re.search(
+        r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}/\d{1,2}/(\d{4})',
+        text,
+        re.IGNORECASE
+    )
     if match:
         return match.group(1)
-    
+
     # Pattern 3: FOR THE PERIOD : DD/MM/YYYY
-    match = re.search(r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}/\d{1,2}/(\d{4})', text, re.IGNORECASE)
+    match = re.search(
+        r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}/\d{1,2}/(\d{4})',
+        text,
+        re.IGNORECASE
+    )
     if match:
         return match.group(1)
-    
-    # Pattern 4: YYYY Statement
-    match = re.search(r'(\d{4})\s+Statement', text, re.IGNORECASE)
-    if match:
-        year = int(match.group(1))
-        if 2000 <= year <= 2100:
-            return str(year)
-    
+
     return None
 
 
 # ---------------------------------------------------------
-# Helper Functions
+# CLOSING BALANCE EXTRACTION (AUTHORITATIVE)
+# ---------------------------------------------------------
+
+def extract_closing_balance_from_text(text):
+    """
+    Extracts CIMB closing balance (Baki Penutup).
+    Example:
+    CLOSING BALANCE / BAKI PENUTUP 51.79
+    """
+    if not text:
+        return None
+
+    match = re.search(
+        r'CLOSING\s+BALANCE\s*/\s*BAKI\s+PENUTUP\s+([\d,]+\.\d{2})',
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return float(match.group(1).replace(",", ""))
+
+    return None
+
+
+# ---------------------------------------------------------
+# HELPERS
 # ---------------------------------------------------------
 
 def parse_float(value):
-    """Converts string '1,234.56' to float 1234.56. Returns 0.0 if empty."""
+    """Converts string '1,234.56' to float."""
     if not value:
         return 0.0
-    clean_val = str(value).replace("\n", "").replace(" ", "").replace(",", "")
-    if not re.match(r'^-?\d+(\.\d+)?$', clean_val):
+
+    clean = str(value).replace(",", "").replace(" ", "").replace("\n", "")
+    if not re.match(r'^-?\d+(\.\d+)?$', clean):
         return 0.0
-    return float(clean_val)
+
+    return float(clean)
 
 
 def clean_text(text):
-    """Removes excess newlines from descriptions."""
+    """Normalize description text."""
     if not text:
         return ""
     return text.replace("\n", " ").strip()
 
 
 def format_date(date_str, year):
-    """
-    Format date string to YYYY-MM-DD.
-    Handles various CIMB date formats.
-    """
+    """Convert CIMB date to YYYY-MM-DD."""
     if not date_str:
         return f"{year}-01-01"
-    
+
     date_str = clean_text(date_str)
-    
-    # Try DD/MM/YYYY format
-    match = re.match(r'(\d{2})/(\d{2})/(\d{4})', date_str)
-    if match:
-        dd, mm, yyyy = match.groups()
-        return f"{yyyy}-{mm}-{dd}"
-    
-    # Try DD/MM format (no year)
-    match = re.match(r'(\d{2})/(\d{2})', date_str)
-    if match:
-        dd, mm = match.groups()
-        return f"{year}-{mm}-{dd}"
-    
-    # Return as-is if already in YYYY-MM-DD format
-    if re.match(r'\d{4}-\d{2}-\d{2}', date_str):
-        return date_str
-    
+
+    # DD/MM/YYYY
+    m = re.match(r'(\d{2})/(\d{2})/(\d{4})', date_str)
+    if m:
+        d, mth, y = m.groups()
+        return f"{y}-{mth}-{d}"
+
+    # DD/MM
+    m = re.match(r'(\d{2})/(\d{2})', date_str)
+    if m:
+        d, mth = m.groups()
+        return f"{year}-{mth}-{d}"
+
     return f"{year}-01-01"
 
 
 # ---------------------------------------------------------
-# Main Parser
+# MAIN PARSER
 # ---------------------------------------------------------
 
 def parse_transactions_cimb(pdf, source_filename=""):
     """
-    Main parser for CIMB Bank statements.
-    Automatically extracts year and parses all transactions.
-    
-    Args:
-        pdf: pdfplumber PDF object
-        source_filename: Name of the source file
-    
-    Returns:
-        List of transaction dictionaries
+    Parses CIMB Bank statements safely.
+    Returns list of transaction dictionaries.
     """
-    all_transactions = []
+    transactions = []
     detected_year = None
-    
-    # Extract year from first few pages
+    closing_balance = None
+
+    # --- Scan first pages for year & closing balance ---
     for page in pdf.pages[:3]:
         text = page.extract_text() or ""
-        detected_year = extract_year_from_text(text)
-        if detected_year:
+
+        if not detected_year:
+            detected_year = extract_year_from_text(text)
+
+        if closing_balance is None:
+            closing_balance = extract_closing_balance_from_text(text)
+
+        if detected_year and closing_balance is not None:
             break
-    
-    # Fallback to current year
+
     if not detected_year:
-        from datetime import datetime
         detected_year = str(datetime.now().year)
-    
-    # Process all pages
-    for page_num, page in enumerate(pdf.pages, start=1):
-        # Extract table using grid lines
+
+    # --- Parse transactions ---
+    for page_no, page in enumerate(pdf.pages, start=1):
         table = page.extract_table()
-        
         if not table:
             continue
-        
+
         for row in table:
-            # CIMB Structure: [Date, Desc, Ref, Withdrawal, Deposit, Balance]
             if not row or len(row) < 6:
                 continue
-            
+
             # Skip headers
-            first_col = str(row[0]).lower() if row[0] else ""
-            if "date" in first_col or "tarikh" in first_col:
+            if row[0] and str(row[0]).lower() in ("date", "tarikh"):
                 continue
-            
-            # Handle Opening Balance
-            desc_text = str(row[1]).lower() if row[1] else ""
-            if "opening balance" in desc_text:
-                all_transactions.append({
+
+            desc = clean_text(row[1]).lower()
+
+            # Opening balance
+            if "opening balance" in desc:
+                transactions.append({
                     "date": "",
                     "description": "OPENING BALANCE",
                     "ref_no": "",
                     "debit": 0.0,
                     "credit": 0.0,
                     "balance": parse_float(row[5]),
-                    "page": page_num,
+                    "page": page_no,
                     "source_file": source_filename,
                     "bank": "CIMB Bank"
                 })
                 continue
-            
-            # Ensure valid balance exists
-            if not row[5]:
+
+            balance = parse_float(row[5])
+            if balance == 0.0:
                 continue
-            
-            # Strict Column Mapping
-            debit_val = parse_float(row[3])   # Col 3 is Withdrawal
-            credit_val = parse_float(row[4])  # Col 4 is Deposit
-            
-            # Skip empty rows (sometimes descriptions spill over without money)
-            if debit_val == 0.0 and credit_val == 0.0:
+
+            debit = parse_float(row[3])
+            credit = parse_float(row[4])
+
+            if debit == 0.0 and credit == 0.0:
                 continue
-            
-            # Format date
-            date_formatted = format_date(row[0], detected_year)
-            
-            tx = {
-                "date": date_formatted,
+
+            transactions.append({
+                "date": format_date(row[0], detected_year),
                 "description": clean_text(row[1]),
                 "ref_no": clean_text(row[2]),
-                "debit": debit_val,
-                "credit": credit_val,
-                "balance": parse_float(row[5]),
-                "page": page_num,
+                "debit": debit,
+                "credit": credit,
+                "balance": balance,
+                "page": page_no,
                 "source_file": source_filename,
                 "bank": "CIMB Bank"
-            }
-            all_transactions.append(tx)
-    
-    return all_transactions
+            })
+
+    # --- Append authoritative closing balance ---
+    if closing_balance is not None:
+        transactions.append({
+            "date": "",
+            "description": "CLOSING BALANCE",
+            "ref_no": "",
+            "debit": 0.0,
+            "credit": 0.0,
+            "balance": closing_balance,
+            "page": None,
+            "source_file": source_filename,
+            "bank": "CIMB Bank",
+            "is_statement_balance": True
+        })
+
+    return transactions
