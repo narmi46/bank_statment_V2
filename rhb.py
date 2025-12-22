@@ -182,34 +182,49 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     transactions = []
 
-    DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    MONEY_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}")
+    DATE_RE = re.compile(r"\d{2}-\d{2}-\d{4}")
+    MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
+    HEADER_RE = re.compile(r"Date\s+Branch\s+Description", re.IGNORECASE)
 
     def norm_date(text):
         return datetime.strptime(text, "%d-%m-%Y").strftime("%Y-%m-%d")
 
+    def parse_balance(text):
+        val = float(text.replace(",", "").replace("-", ""))
+        return -val if text.endswith("-") else val
+
     # ==================================================
-    # 1️⃣ Extract OPENING BALANCE first (CRITICAL)
+    # Helper: extract opening balance AFTER each header
     # ==================================================
-    def extract_opening_balance():
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                if "Beginning Balance" in text:
-                    m = re.search(r"([\d,]+\.\d{2})-", text)
-                    if m:
-                        return -float(m.group(1).replace(",", ""))
+    def extract_opening_balance_from_text(text):
+        for line in text.splitlines():
+            if "Beginning Balance" in line:
+                m = re.search(r"([\d,]+\.\d{2})-", line)
+                if m:
+                    return -float(m.group(1).replace(",", ""))
         return None
 
-    previous_balance = extract_opening_balance()
-
-    # ==================================================
-    # 2️⃣ Parse TRANSACTIONS using layout
-    # ==================================================
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
+    previous_balance = None
+    in_table = False
+
     for page_index, page in enumerate(doc):
+        page_text = page.get_text()
         words = page.get_text("words")
+
+        # ----------------------------------------------
+        # Detect NEW TRANSACTION TABLE (RESET POINT)
+        # ----------------------------------------------
+        if HEADER_RE.search(page_text):
+            in_table = True
+            opening_balance = extract_opening_balance_from_text(page_text)
+            if opening_balance is not None:
+                previous_balance = opening_balance
+            continue
+
+        if not in_table:
+            continue
 
         rows = [{
             "x": w[0],
@@ -221,32 +236,23 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
         used_y = set()
 
         for r in rows:
-            if not DATE_RE.match(r["text"]):
+            if not DATE_RE.fullmatch(r["text"]):
                 continue
 
             y = r["y"]
             if y in used_y:
                 continue
 
-            line = [w for w in rows if abs(w["y"] - y) <= 1.5]
+            line = [w for w in rows if abs(w["y"] - y) <= 2.0]
             line.sort(key=lambda w: w["x"])
 
-            money = [w for w in line if MONEY_RE.match(w["text"])]
-            if len(money) < 2:
+            money = [w for w in line if MONEY_RE.fullmatch(w["text"])]
+            if len(money) < 1:
                 continue
 
             bal_word = money[-1]
+            bal_val = parse_balance(bal_word["text"])
 
-            # ------------------------------
-            # Balance (overdraft safe)
-            # ------------------------------
-            bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
-            if bal_word["text"].endswith("-"):
-                bal_val = -bal_val
-
-            # ------------------------------
-            # DR / CR by BALANCE MOVEMENT
-            # ------------------------------
             debit = credit = 0.0
             if previous_balance is not None:
                 delta = bal_val - previous_balance
@@ -255,9 +261,6 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 elif delta > 0:
                     credit = delta
 
-            # ------------------------------
-            # Description
-            # ------------------------------
             description = [
                 w["text"] for w in line
                 if w not in money
@@ -281,6 +284,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     doc.close()
     return transactions
+
 
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
