@@ -281,3 +281,21 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
 
     doc.close()
     return transactions
+
+def parse_transactions_rhb(pdf_input, source_filename):
+    pdf_bytes = _read_pdf_bytes(pdf_input)
+
+    for parser in (
+        _parse_rhb_islamic_text,
+        _parse_rhb_conventional_text,
+        _parse_rhb_reflex_layout,
+    ):
+        try:
+            tx = parser(pdf_bytes, source_filename)
+            if tx:
+                return tx
+        except Exception:
+            continue
+
+    return []
+
