@@ -1,31 +1,30 @@
 import re
-import fitz
+import fitz  # PyMuPDF
 import pdfplumber
 from datetime import datetime
 from io import BytesIO
 
 
 # ======================================================
-# Helper: read PDF bytes safely (STREAMLIT SAFE)
+# Helper: read PDF bytes safely (Streamlit / file / path)
 # ======================================================
 def _read_pdf_bytes(pdf_input):
-    # Case 1: already raw bytes
+    # Case 1: raw bytes
     if isinstance(pdf_input, (bytes, bytearray)):
         return bytes(pdf_input)
 
-    # Case 2: Streamlit UploadedFile (CRITICAL FIX)
+    # Case 2: Streamlit UploadedFile
     if hasattr(pdf_input, "getvalue"):
         data = pdf_input.getvalue()
         if data:
             return data
 
-    # Case 3: generic file-like object
+    # Case 3: file-like object
     if hasattr(pdf_input, "read"):
         try:
             pdf_input.seek(0)
         except Exception:
             pass
-
         data = pdf_input.read()
         if data:
             return data
@@ -39,7 +38,7 @@ def _read_pdf_bytes(pdf_input):
 
 
 # ======================================================
-# 1️⃣ RHB ISLAMIC — TEXT BASED (UNCHANGED)
+# 1️⃣ RHB ISLAMIC — TEXT BASED
 # ======================================================
 def _parse_rhb_islamic_text(pdf_bytes, source_filename):
     transactions = []
@@ -50,11 +49,7 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
 
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         header = pdf.pages[0].extract_text() or ""
-        period_match = re.search(
-            r"Statement Period.*?(\d{2})",
-            header,
-            re.IGNORECASE
-        )
+        period_match = re.search(r"Statement Period.*?(\d{2})", header, re.IGNORECASE)
         if not period_match:
             return []
 
@@ -111,7 +106,7 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 2️⃣ RHB CONVENTIONAL — TEXT BASED (UNCHANGED)
+# 2️⃣ RHB CONVENTIONAL — TEXT BASED
 # ======================================================
 def _parse_rhb_conventional_text(pdf_bytes, source_filename):
     transactions = []
@@ -175,7 +170,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX — LAYOUT BASED (YOUR LOGIC, FIXED)
+# 3️⃣ RHB REFLEX — LAYOUT BASED (YOUR LOGIC)
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     transactions = []
@@ -185,8 +180,8 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
     MONEY_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}")
 
-    def norm_date(t):
-        return datetime.strptime(t, "%d-%m-%Y").strftime("%Y-%m-%d")
+    def norm_date(text):
+        return datetime.strptime(text, "%d-%m-%Y").strftime("%Y-%m-%d")
 
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
@@ -212,26 +207,23 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             line.sort(key=lambda w: w["x"])
 
             money = [w for w in line if MONEY_RE.match(w["text"])]
-
-            # ✅ FIX: Reflex rows have 2 money values
             if len(money) < 2:
                 continue
 
             txn_word = money[0]
             bal_word = money[-1]
 
-            amt = float(txn_word["text"].replace(",", ""))
+            amount = float(txn_word["text"].replace(",", ""))
 
             bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
             if bal_word["text"].endswith("-"):
                 bal_val = -bal_val
 
-            # DR / CR by column population
             debit = credit = 0.0
             if txn_word["x"] < bal_word["x"]:
-                debit = amt
+                debit = amount
             else:
-                credit = amt
+                credit = amount
 
             description = [
                 w["text"] for w in line
@@ -257,9 +249,8 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     return transactions
 
 
-
 # ======================================================
-# 🚦 PUBLIC ENTRYPOINT (DO NOT RENAME)
+# 🚦 PUBLIC ENTRYPOINT (USED BY app.py)
 # ======================================================
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
@@ -269,8 +260,8 @@ def parse_transactions_rhb(pdf_input, source_filename):
         _parse_rhb_conventional_text,
         _parse_rhb_reflex_layout,
     ):
-        tx = parser(pdf_bytes, source_filename)
-        if tx:
-            return tx
+        transactions = parser(pdf_bytes, source_filename)
+        if transactions:
+            return transactions
 
     return []
