@@ -1,10 +1,13 @@
-# cimb.py - CIMB Parser (LAST TRANSACTION BALANCE MODE)
+# cimb.py - Standalone CIMB Bank Parser
+# Strategy:
+# - Transactions: table-based parsing
+# - Ending balance: layout/text regex parsing (authoritative)
 
 import re
 from datetime import datetime
 
 # ---------------------------------------------------------
-# YEAR EXTRACTION
+# YEAR EXTRACTION (layout-based)
 # ---------------------------------------------------------
 
 def extract_year_from_text(text):
@@ -24,6 +27,30 @@ def extract_year_from_text(text):
 
 
 # ---------------------------------------------------------
+# CLOSING BALANCE EXTRACTION (layout-based, authoritative)
+# ---------------------------------------------------------
+
+def extract_closing_balance_from_text(text):
+    """
+    Extracts:
+    CLOSING BALANCE / BAKI PENUTUP 51.79
+    """
+    if not text:
+        return None
+
+    match = re.search(
+        r'CLOSING\s+BALANCE\s*/\s*BAKI\s+PENUTUP\s+([\d,]+\.\d{2})',
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return float(match.group(1).replace(",", ""))
+
+    return None
+
+
+# ---------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------
 
@@ -31,7 +58,9 @@ def parse_float(value):
     if not value:
         return 0.0
     clean = str(value).replace(",", "").replace(" ", "").replace("\n", "")
-    return float(clean) if re.match(r'^-?\d+(\.\d+)?$', clean) else 0.0
+    if not re.match(r'^-?\d+(\.\d+)?$', clean):
+        return 0.0
+    return float(clean)
 
 
 def clean_text(text):
@@ -64,44 +93,58 @@ def format_date(date_str, year):
 def parse_transactions_cimb(pdf, source_filename=""):
     transactions = []
     detected_year = None
-    row_counter = 0
+    closing_balance = None
 
-    # Detect year
-    for page in pdf.pages[:3]:
+    # ---------------------------------------------
+    # PASS 1: Layout scan (year + closing balance)
+    # ---------------------------------------------
+    for page in pdf.pages:
         text = page.extract_text() or ""
-        detected_year = extract_year_from_text(text)
-        if detected_year:
+
+        if not detected_year:
+            detected_year = extract_year_from_text(text)
+
+        if closing_balance is None:
+            closing_balance = extract_closing_balance_from_text(text)
+
+        if detected_year and closing_balance is not None:
             break
 
     if not detected_year:
         detected_year = str(datetime.now().year)
 
-    # Parse tables
+    # ---------------------------------------------
+    # PASS 2: Table-based transaction parsing
+    # ---------------------------------------------
+    row_index = 0
+
     for page_no, page in enumerate(pdf.pages, start=1):
         table = page.extract_table()
         if not table:
             continue
 
         for row in table:
-            row_counter += 1
+            row_index += 1
 
             if not row or len(row) < 6:
                 continue
 
             # Skip headers
-            if row[0] and str(row[0]).lower() in ("date", "tarikh"):
+            first_col = str(row[0]).lower() if row[0] else ""
+            if "date" in first_col or "tarikh" in first_col:
                 continue
 
-            desc = clean_text(row[1]).lower()
+            desc_lower = clean_text(row[1]).lower()
 
-            # Skip opening balance
-            if "opening balance" in desc:
+            # Skip opening balance rows
+            if "opening balance" in desc_lower:
                 continue
 
             debit = parse_float(row[3])
             credit = parse_float(row[4])
             balance = parse_float(row[5])
 
+            # Skip non-transaction spill rows
             if debit == 0.0 and credit == 0.0:
                 continue
 
@@ -116,31 +159,24 @@ def parse_transactions_cimb(pdf, source_filename=""):
                 "credit": credit,
                 "balance": balance,
                 "page": page_no,
-                "row_index": row_counter,
+                "row_index": row_index,
                 "source_file": source_filename,
                 "bank": "CIMB Bank"
             })
 
-    # -------------------------------------------------
-    # FORCE CLOSING BALANCE = LAST TRANSACTION BALANCE
-    # -------------------------------------------------
-
-    if transactions:
-        # Sort properly before choosing "last"
-        transactions.sort(
-            key=lambda x: (x["date"], x["page"], x["row_index"])
-        )
-
-        last_tx = transactions[-1]
-
+    # ---------------------------------------------
+    # FINAL: Append authoritative closing balance
+    # ---------------------------------------------
+    if closing_balance is not None:
         transactions.append({
-            "date": last_tx["date"],
-            "description": "CLOSING BALANCE (FROM LAST TRANSACTION)",
+            "date": "",
+            "description": "CLOSING BALANCE / BAKI PENUTUP",
             "ref_no": "",
             "debit": 0.0,
             "credit": 0.0,
-            "balance": last_tx["balance"],
-            "page": last_tx["page"],
+            "balance": closing_balance,
+            "page": None,
+            "row_index": None,
             "source_file": source_filename,
             "bank": "CIMB Bank",
             "is_statement_balance": True
