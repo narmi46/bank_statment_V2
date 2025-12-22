@@ -1,16 +1,19 @@
 # cimb.py - Standalone CIMB Bank Parser
-# Strategy:
-# - Transactions: table-based parsing
-# - Ending balance: layout/text regex parsing (authoritative)
+# Fix: Closing balance row now gets a real date (latest transaction date),
+# so Streamlit monthly summary won't drop it.
 
 import re
 from datetime import datetime
 
 # ---------------------------------------------------------
-# YEAR EXTRACTION (layout-based)
+# YEAR EXTRACTION
 # ---------------------------------------------------------
 
 def extract_year_from_text(text):
+    """
+    Extract year from CIMB statement.
+    Handles 4-digit and 2-digit year formats.
+    """
     if not text:
         return None
 
@@ -27,12 +30,12 @@ def extract_year_from_text(text):
 
 
 # ---------------------------------------------------------
-# CLOSING BALANCE EXTRACTION (layout-based, authoritative)
+# CLOSING BALANCE EXTRACTION (layout regex)
 # ---------------------------------------------------------
 
 def extract_closing_balance_from_text(text):
     """
-    Extracts:
+    Extract:
     CLOSING BALANCE / BAKI PENUTUP 51.79
     """
     if not text:
@@ -43,7 +46,6 @@ def extract_closing_balance_from_text(text):
         text,
         re.IGNORECASE
     )
-
     if match:
         return float(match.group(1).replace(",", ""))
 
@@ -55,35 +57,49 @@ def extract_closing_balance_from_text(text):
 # ---------------------------------------------------------
 
 def parse_float(value):
+    """Converts string '1,234.56' to float 1234.56. Returns 0.0 if invalid."""
     if not value:
         return 0.0
-    clean = str(value).replace(",", "").replace(" ", "").replace("\n", "")
+    clean = str(value).replace("\n", "").replace(" ", "").replace(",", "")
     if not re.match(r'^-?\d+(\.\d+)?$', clean):
         return 0.0
     return float(clean)
 
 
 def clean_text(text):
-    return text.replace("\n", " ").strip() if text else ""
+    """Removes excess newlines from descriptions."""
+    if not text:
+        return ""
+    return text.replace("\n", " ").strip()
 
 
 def format_date(date_str, year):
+    """
+    Format date string to YYYY-MM-DD.
+    Handles DD/MM/YYYY and DD/MM.
+    """
     if not date_str:
-        return f"{year}-01-01"
+        return None
 
     date_str = clean_text(date_str)
 
-    m = re.match(r'(\d{2})/(\d{2})/(\d{4})', date_str)
+    # DD/MM/YYYY
+    m = re.match(r'(\d{2})/(\d{2})/(\d{4})$', date_str)
     if m:
-        d, mth, y = m.groups()
-        return f"{y}-{mth}-{d}"
+        dd, mm, yyyy = m.groups()
+        return f"{yyyy}-{mm}-{dd}"
 
-    m = re.match(r'(\d{2})/(\d{2})', date_str)
+    # DD/MM
+    m = re.match(r'(\d{2})/(\d{2})$', date_str)
     if m:
-        d, mth = m.groups()
-        return f"{year}-{mth}-{d}"
+        dd, mm = m.groups()
+        return f"{year}-{mm}-{dd}"
 
-    return f"{year}-01-01"
+    # Already YYYY-MM-DD
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        return date_str
+
+    return None
 
 
 # ---------------------------------------------------------
@@ -91,13 +107,17 @@ def format_date(date_str, year):
 # ---------------------------------------------------------
 
 def parse_transactions_cimb(pdf, source_filename=""):
+    """
+    CIMB parser:
+    - Transactions from table
+    - Closing balance from layout regex
+    - Closing balance row gets date = latest transaction date (so app.py keeps it)
+    """
     transactions = []
     detected_year = None
     closing_balance = None
 
-    # ---------------------------------------------
-    # PASS 1: Layout scan (year + closing balance)
-    # ---------------------------------------------
+    # ---- Pass 1: detect year + closing balance from layout text ----
     for page in pdf.pages:
         text = page.extract_text() or ""
 
@@ -113,19 +133,16 @@ def parse_transactions_cimb(pdf, source_filename=""):
     if not detected_year:
         detected_year = str(datetime.now().year)
 
-    # ---------------------------------------------
-    # PASS 2: Table-based transaction parsing
-    # ---------------------------------------------
-    row_index = 0
+    latest_tx_date = None  # YYYY-MM-DD string
 
-    for page_no, page in enumerate(pdf.pages, start=1):
+    # ---- Pass 2: parse transaction table ----
+    for page_num, page in enumerate(pdf.pages, start=1):
         table = page.extract_table()
         if not table:
             continue
 
         for row in table:
-            row_index += 1
-
+            # CIMB Structure: [Date, Desc, Ref, Withdrawal, Deposit, Balance]
             if not row or len(row) < 6:
                 continue
 
@@ -134,49 +151,55 @@ def parse_transactions_cimb(pdf, source_filename=""):
             if "date" in first_col or "tarikh" in first_col:
                 continue
 
-            desc_lower = clean_text(row[1]).lower()
-
-            # Skip opening balance rows
-            if "opening balance" in desc_lower:
+            desc_text = str(row[1]).lower() if row[1] else ""
+            if "opening balance" in desc_text:
+                # (Optional) keep opening balance row if you want
                 continue
 
-            debit = parse_float(row[3])
-            credit = parse_float(row[4])
-            balance = parse_float(row[5])
-
-            # Skip non-transaction spill rows
-            if debit == 0.0 and credit == 0.0:
+            if not row[5]:
                 continue
 
-            if balance == 0.0:
+            debit_val = parse_float(row[3])   # Withdrawal
+            credit_val = parse_float(row[4])  # Deposit
+
+            # skip spill rows without amounts
+            if debit_val == 0.0 and credit_val == 0.0:
                 continue
 
-            transactions.append({
-                "date": format_date(row[0], detected_year),
+            date_formatted = format_date(row[0], detected_year)
+            if not date_formatted:
+                continue
+
+            # track latest transaction date
+            if latest_tx_date is None or date_formatted > latest_tx_date:
+                latest_tx_date = date_formatted
+
+            tx = {
+                "date": date_formatted,
                 "description": clean_text(row[1]),
                 "ref_no": clean_text(row[2]),
-                "debit": debit,
-                "credit": credit,
-                "balance": balance,
-                "page": page_no,
-                "row_index": row_index,
+                "debit": debit_val,
+                "credit": credit_val,
+                "balance": parse_float(row[5]),
+                "page": page_num,
                 "source_file": source_filename,
                 "bank": "CIMB Bank"
-            })
+            }
+            transactions.append(tx)
 
-    # ---------------------------------------------
-    # FINAL: Append authoritative closing balance
-    # ---------------------------------------------
+    # ---- Append closing balance row with a REAL DATE so app.py won't drop it ----
     if closing_balance is not None:
+        # Use latest transaction date so it falls into the correct month in monthly summary
+        cb_date = latest_tx_date or f"{detected_year}-01-01"
+
         transactions.append({
-            "date": "",
+            "date": cb_date,
             "description": "CLOSING BALANCE / BAKI PENUTUP",
             "ref_no": "",
             "debit": 0.0,
             "credit": 0.0,
             "balance": closing_balance,
             "page": None,
-            "row_index": None,
             "source_file": source_filename,
             "bank": "CIMB Bank",
             "is_statement_balance": True
