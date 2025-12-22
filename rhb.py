@@ -171,7 +171,7 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 
 
 # ======================================================
-# 3️⃣ RHB REFLEX — LAYOUT BASED (YOUR LOGIC)
+# 3️⃣ RHB REFLEX — LAYOUT BASED (FIXED VERSION)
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     import re
@@ -179,71 +179,90 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
     import pdfplumber
     from io import BytesIO
     from datetime import datetime
-
+    
     transactions = []
-
+    
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    MONEY_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}")
-
+    # Updated MONEY_RE to optionally capture +/- signs
+    MONEY_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}[+-]?")
+    
     def norm_date(text):
         return datetime.strptime(text, "%d-%m-%Y").strftime("%Y-%m-%d")
-
+    
     # ==================================================
-    # 1️⃣ Extract OPENING BALANCE first (CRITICAL)
+    # 1️⃣ Extract OPENING BALANCE first (CRITICAL) - FIXED
     # ==================================================
     def extract_opening_balance():
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text() or ""
                 if "Beginning Balance" in text:
-                    m = re.search(r"([\d,]+\.\d{2})-", text)
+                    # NEW: Handle both positive and negative balances
+                    # Matches: "251,613.85", "251,613.85+", or "845,425.30-"
+                    m = re.search(r"([\d,]+\.\d{2})([+-])?", text)
                     if m:
-                        return -float(m.group(1).replace(",", ""))
+                        amount = float(m.group(1).replace(",", ""))
+                        # If there's a minus sign, make it negative
+                        if m.group(2) == "-":
+                            amount = -amount
+                        # If plus sign or no sign, keep positive
+                        return amount
         return None
-
+    
     previous_balance = extract_opening_balance()
-
+    
     # ==================================================
-    # 2️⃣ Parse TRANSACTIONS using layout
+    # 2️⃣ Parse TRANSACTIONS using layout - FIXED
     # ==================================================
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
+    
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
-
+        
         rows = [{
             "x": w[0],
             "y": round(w[1], 1),
             "text": w[4].strip()
         } for w in words if w[4].strip()]
-
+        
         rows.sort(key=lambda r: (r["y"], r["x"]))
         used_y = set()
-
+        
         for r in rows:
             if not DATE_RE.match(r["text"]):
                 continue
-
+            
             y = r["y"]
             if y in used_y:
                 continue
-
+            
             line = [w for w in rows if abs(w["y"] - y) <= 1.5]
             line.sort(key=lambda w: w["x"])
-
+            
             money = [w for w in line if MONEY_RE.match(w["text"])]
             if len(money) < 2:
                 continue
-
+            
             bal_word = money[-1]
-
+            
             # ------------------------------
-            # Balance (overdraft safe)
+            # Balance (FIXED: handles both + and -)
             # ------------------------------
-            bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
-            if bal_word["text"].endswith("-"):
+            bal_text = bal_word["text"].replace(",", "")
+            
+            # Check for negative (overdraft)
+            is_negative = bal_text.endswith("-")
+            # Check for positive (some statements mark with +)
+            is_positive = bal_text.endswith("+")
+            
+            # Remove all signs and convert to float
+            bal_val = float(bal_text.replace("-", "").replace("+", ""))
+            
+            # Apply sign
+            if is_negative:
                 bal_val = -bal_val
-
+            # If is_positive or no sign, keep positive (default)
+            
             # ------------------------------
             # DR / CR by BALANCE MOVEMENT
             # ------------------------------
@@ -254,7 +273,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                     debit = abs(delta)
                 elif delta > 0:
                     credit = delta
-
+            
             # ------------------------------
             # Description
             # ------------------------------
@@ -264,7 +283,7 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 and not DATE_RE.match(w["text"])
                 and not w["text"].isdigit()
             ]
-
+            
             transactions.append({
                 "date": norm_date(r["text"]),
                 "description": " ".join(description)[:200],
@@ -275,12 +294,46 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "bank": "RHB Bank",
                 "source_file": source_filename
             })
-
+            
             previous_balance = bal_val
             used_y.add(y)
-
+    
     doc.close()
     return transactions
+
+
+# ==================================================
+# WHAT WAS FIXED:
+# ==================================================
+"""
+1. extract_opening_balance():
+   OLD: m = re.search(r"([\d,]+\.\d{2})-", text)
+        Only matched negative balances like "845,425.30-"
+   
+   NEW: m = re.search(r"([\d,]+\.\d{2})([+-])?", text)
+        Matches: "251,613.85", "251,613.85+", "845,425.30-"
+        Checks group(2) for sign and applies it
+
+2. MONEY_RE pattern:
+   OLD: r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}"
+        Didn't include +/- in pattern
+   
+   NEW: r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}[+-]?"
+        Now optionally matches trailing +/- signs
+
+3. Balance parsing:
+   OLD: bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
+        if bal_word["text"].endswith("-"):
+            bal_val = -bal_val
+        Only checked for dash (-)
+   
+   NEW: Checks for both "-" and "+"
+        - If ends with "-": negative (overdraft)
+        - If ends with "+": positive (explicit)
+        - If no sign: positive (default)
+
+RESULT: Now works for BOTH overdraft and regular accounts!
+"""
 
 def parse_transactions_rhb(pdf_input, source_filename):
     pdf_bytes = _read_pdf_bytes(pdf_input)
