@@ -108,6 +108,7 @@ def _parse_rhb_islamic_text(pdf_bytes, source_filename):
 # ======================================================
 # 2️⃣ RHB CONVENTIONAL — TEXT BASED
 # ======================================================
+
 def _parse_rhb_conventional_text(pdf_bytes, source_filename):
     transactions = []
     previous_balance = None
@@ -173,15 +174,39 @@ def _parse_rhb_conventional_text(pdf_bytes, source_filename):
 # 3️⃣ RHB REFLEX — LAYOUT BASED (YOUR LOGIC)
 # ======================================================
 def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
-    transactions = []
+    import re
+    import fitz
+    import pdfplumber
+    from io import BytesIO
+    from datetime import datetime
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    transactions = []
 
     DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
     MONEY_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d)?\.\d{2}")
 
     def norm_date(text):
         return datetime.strptime(text, "%d-%m-%Y").strftime("%Y-%m-%d")
+
+    # ==================================================
+    # 1️⃣ Extract OPENING BALANCE first (CRITICAL)
+    # ==================================================
+    def extract_opening_balance():
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                if "Beginning Balance" in text:
+                    m = re.search(r"([\d,]+\.\d{2})-", text)
+                    if m:
+                        return -float(m.group(1).replace(",", ""))
+        return None
+
+    previous_balance = extract_opening_balance()
+
+    # ==================================================
+    # 2️⃣ Parse TRANSACTIONS using layout
+    # ==================================================
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     for page_index, page in enumerate(doc):
         words = page.get_text("words")
@@ -210,21 +235,29 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
             if len(money) < 2:
                 continue
 
-            txn_word = money[0]
             bal_word = money[-1]
 
-            amount = float(txn_word["text"].replace(",", ""))
-
+            # ------------------------------
+            # Balance (overdraft safe)
+            # ------------------------------
             bal_val = float(bal_word["text"].replace(",", "").replace("-", ""))
             if bal_word["text"].endswith("-"):
                 bal_val = -bal_val
 
+            # ------------------------------
+            # DR / CR by BALANCE MOVEMENT
+            # ------------------------------
             debit = credit = 0.0
-            if txn_word["x"] < bal_word["x"]:
-                debit = amount
-            else:
-                credit = amount
+            if previous_balance is not None:
+                delta = bal_val - previous_balance
+                if delta < 0:
+                    debit = abs(delta)
+                elif delta > 0:
+                    credit = delta
 
+            # ------------------------------
+            # Description
+            # ------------------------------
             description = [
                 w["text"] for w in line
                 if w not in money
@@ -243,25 +276,8 @@ def _parse_rhb_reflex_layout(pdf_bytes, source_filename):
                 "source_file": source_filename
             })
 
+            previous_balance = bal_val
             used_y.add(y)
 
     doc.close()
     return transactions
-
-
-# ======================================================
-# 🚦 PUBLIC ENTRYPOINT (USED BY app.py)
-# ======================================================
-def parse_transactions_rhb(pdf_input, source_filename):
-    pdf_bytes = _read_pdf_bytes(pdf_input)
-
-    for parser in (
-        _parse_rhb_islamic_text,
-        _parse_rhb_conventional_text,
-        _parse_rhb_reflex_layout,
-    ):
-        transactions = parser(pdf_bytes, source_filename)
-        if transactions:
-            return transactions
-
-    return []
