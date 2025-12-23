@@ -335,8 +335,8 @@ def parse_bank_islam(pdf, source_file):
     if tx:
         return tx
 
-        tx = parse_bank_islam_format3(pdf, source_file)
+        tx = parse_bank_islam_format4(pdf, source_file)
     if tx:
         return tx
 
-    return parse_bank_islam_format4(pdf, source_file)
+    return parse_bank_islam_format3(pdf, source_file)
