@@ -87,7 +87,7 @@ from datetime import datetime
 MONEY_RE = re.compile(r"\(?-?[\d,]+\.\d{2}\)?")
 
 # Line must START with a date (prevents STATEMENT DATE header)
-DATE_AT_START_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{2,4})\b")
+DATE_AT_START_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
 
 
 def _to_float(val):
