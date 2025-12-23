@@ -77,14 +77,18 @@ def parse_bank_islam_format1(pdf, source_file):
 
 
 # =========================================================
-# BANK ISLAM – FORMAT 2 (TEXT / STATEMENT-BASED)  ✅ FIXED
+# BANK ISLAM – FORMAT 2 (TEXT / STATEMENT-BASED) ✅ UPDATED
 # =========================================================
 
-# Only match amounts that look like money: must have .xx decimals
+import re
+from datetime import datetime
+
+# Money must look like currency (prevents UNIT 10-9, page numbers, etc)
 MONEY_RE = re.compile(r"\(?-?[\d,]+\.\d{2}\)?")
 
-# Line must START with date (prevents "STATEMENT DATE : 30/11/24" in headers)
+# Line must START with a date (prevents STATEMENT DATE header)
 DATE_AT_START_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{2,4})\b")
+
 
 def _to_float(val):
     if not val:
@@ -98,16 +102,17 @@ def _to_float(val):
     except ValueError:
         return None
 
+
 def _parse_date(d):
     if not d:
         return None
-    d = d.strip()
     for fmt in ("%d/%m/%y", "%d/%m/%Y"):
         try:
-            return datetime.strptime(d, fmt).date().isoformat()
+            return datetime.strptime(d.strip(), fmt).date().isoformat()
         except ValueError:
             pass
     return None
+
 
 def parse_bank_islam_format2(pdf, source_file):
     transactions = []
@@ -119,12 +124,12 @@ def parse_bank_islam_format2(pdf, source_file):
         for line in lines:
             upper = line.upper()
 
-            # 🔥 KEY FIX: ignore header lines that contain STATEMENT DATE
-            if "STATEMENT DATE" in upper:
+            # ❌ Ignore headers / footers
+            if "STATEMENT DATE" in upper or "SUMMARY OF ACCOUNT" in upper:
                 continue
 
-            # 🔥 KEY FIX: only accept lines that START with a transaction date
-            m_date = DATE_AT_START_RE.search(line)
+            # ✅ Must START with date
+            m_date = DATE_AT_START_RE.match(line)
             if not m_date:
                 continue
 
@@ -132,32 +137,35 @@ def parse_bank_islam_format2(pdf, source_file):
             if not date:
                 continue
 
-            # Extract only money-looking tokens (with .xx)
+            # Extract currency-looking numbers only
             money_raw = MONEY_RE.findall(line)
             money_vals = [_to_float(x) for x in money_raw]
             money_vals = [x for x in money_vals if x is not None]
 
-            # For Bank Islam statement rows, we usually expect:
-            #   <amount> <balance>
-            if len(money_vals) < 2:
+            # 🔥 FIX: allow single-amount rows
+            if len(money_vals) == 1:
+                amount = money_vals[0]
+                balance = None
+            elif len(money_vals) >= 2:
+                amount = money_vals[-2]
+                balance = money_vals[-1]
+            else:
                 continue
 
-            amount = money_vals[-2]
-            balance = money_vals[-1]
-
-            # Description: remove date + last two money tokens
+            # Build description safely
             desc = line[len(m_date.group(1)):].strip()
-            # remove only the last two occurrences safely
             for tok in money_raw[-2:]:
                 desc = desc.replace(tok, "").strip()
 
             desc_upper = desc.upper()
             debit = credit = 0.0
 
-            # Decide debit/credit (simple heuristic)
+            # Decide debit / credit
             if amount < 0:
                 debit = abs(amount)
-            elif any(k in desc_upper for k in ["PROFIT", "CR", "CREDIT", "RECEIVED", "IN"]):
+            elif any(k in desc_upper for k in [
+                "PROFIT", "CR", "CREDIT", "RECEIVED", "TRANSFER FUND", "ADVICE"
+            ]):
                 credit = amount
             else:
                 debit = amount
@@ -167,7 +175,7 @@ def parse_bank_islam_format2(pdf, source_file):
                 "description": desc,
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
-                "balance": round(balance, 2),
+                "balance": round(balance, 2) if balance is not None else None,
                 "page": page_num,
                 "bank": "Bank Islam",
                 "source_file": source_file,
