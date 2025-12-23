@@ -207,14 +207,41 @@ def parse_bank_islam_format3(pdf, source_file):
                 continue
 
             # 2️⃣ START NEW TRANSACTION (DATE LINE)
+
             m = DATE_RE.match(line)
             if m and prev_balance is not None:
-                current = {
-                    "date": parse_date(m.group(1)),
-                    "description": line[m.end():].strip(),  # ✅ FIRST LINE ONLY
-                    "page": page_num
-                }
-                continue
+                nums = MONEY_RE.findall(line)
+            
+                description = line[m.end():].strip()
+            
+                # ✅ CASE: balance is on SAME LINE (e.g. PROFIT PAID)
+                if len(nums) >= 2:
+                    balance = to_float(nums[-1])
+                    delta = round(balance - prev_balance, 2)
+            
+                    transactions.append({
+                        "date": parse_date(m.group(1)),
+                        "description": description,
+                        "debit": abs(delta) if delta < 0 else 0.0,
+                        "credit": delta if delta > 0 else 0.0,
+                        "balance": round(balance, 2),
+                        "page": page_num,
+                        "bank": "Bank Islam",
+                        "source_file": source_file,
+                        "format": "format3_estatement"
+                    })
+            
+                    prev_balance = balance
+                    current = None
+                    continue
+
+    # ✅ NORMAL MULTI-LINE CASE
+    current = {
+        "date": parse_date(m.group(1)),
+        "description": description,
+        "page": page_num
+    }
+    continue
 
             # 3️⃣ LOOK FOR BALANCE LINE
             if current:
