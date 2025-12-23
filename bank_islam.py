@@ -77,23 +77,25 @@ def parse_bank_islam_format1(pdf, source_file):
 
 
 # =========================================================
-# BANK ISLAM – FORMAT 2 (TEXT / STATEMENT-BASED) ✅ UPDATED
+# BANK ISLAM – FORMAT 2 (TEXT / STATEMENT-BASED)
+# 100% BALANCE DELTA DR/CR LOGIC
 # =========================================================
 
 import re
 from datetime import datetime
 
-# Money must look like currency (prevents UNIT 10-9, page numbers, etc)
+# Money must be currency-looking
 MONEY_RE = re.compile(r"\(?-?[\d,]+\.\d{2}\)?")
 
-# Line must START with a date (prevents STATEMENT DATE header)
+# Date can be 1–2 digit day/month
 DATE_AT_START_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
+
+BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
 
 
 def _to_float(val):
     if not val:
         return None
-    val = val.strip()
     neg = val.startswith("(") and val.endswith(")")
     val = val.strip("()").replace(",", "")
     try:
@@ -104,8 +106,6 @@ def _to_float(val):
 
 
 def _parse_date(d):
-    if not d:
-        return None
     for fmt in ("%d/%m/%y", "%d/%m/%Y"):
         try:
             return datetime.strptime(d.strip(), fmt).date().isoformat()
@@ -117,6 +117,9 @@ def _parse_date(d):
 def parse_bank_islam_format2(pdf, source_file):
     transactions = []
 
+    opening_balance = None
+    prev_balance = None
+
     for page_num, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
         lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
@@ -124,62 +127,68 @@ def parse_bank_islam_format2(pdf, source_file):
         for line in lines:
             upper = line.upper()
 
-            # ❌ Ignore headers / footers
-            if "STATEMENT DATE" in upper or "SUMMARY OF ACCOUNT" in upper:
+            # -------------------------------------------------
+            # 1️⃣ OPENING BALANCE (BAL B/F)
+            # -------------------------------------------------
+            if BAL_BF_RE.search(upper):
+                money = MONEY_RE.findall(line)
+                if money:
+                    opening_balance = _to_float(money[-1])
+                    prev_balance = opening_balance
                 continue
 
-            # ✅ Must START with date
+            # -------------------------------------------------
+            # 2️⃣ TRANSACTION LINES (must start with date)
+            # -------------------------------------------------
             m_date = DATE_AT_START_RE.match(line)
-            if not m_date:
+            if not m_date or prev_balance is None:
                 continue
 
             date = _parse_date(m_date.group(1))
             if not date:
                 continue
 
-            # Extract currency-looking numbers only
             money_raw = MONEY_RE.findall(line)
-            money_vals = [_to_float(x) for x in money_raw]
-            money_vals = [x for x in money_vals if x is not None]
+            money_vals = [_to_float(x) for x in money_raw if _to_float(x) is not None]
 
-            # 🔥 FIX: allow single-amount rows
-            if len(money_vals) == 1:
-                amount = money_vals[0]
-                balance = None
-            elif len(money_vals) >= 2:
-                amount = money_vals[-2]
-                balance = money_vals[-1]
-            else:
+            # Must have at least a balance
+            if not money_vals:
                 continue
 
-            # Build description safely
-            desc = line[len(m_date.group(1)):].strip()
-            for tok in money_raw[-2:]:
-                desc = desc.replace(tok, "").strip()
+            # Last number is always the balance
+            balance = money_vals[-1]
 
-            desc_upper = desc.upper()
-            debit = credit = 0.0
+            # -------------------------------------------------
+            # 3️⃣ BALANCE DELTA LOGIC (THE CORE)
+            # -------------------------------------------------
+            delta = round(balance - prev_balance, 2)
 
-            # Decide debit / credit
-            if amount < 0:
-                debit = abs(amount)
-            elif any(k in desc_upper for k in [
-                "PROFIT", "CR", "CREDIT", "RECEIVED", "TRANSFER FUND", "ADVICE"
-            ]):
-                credit = amount
+            if delta > 0:
+                credit = delta
+                debit = 0.0
             else:
-                debit = amount
+                debit = abs(delta)
+                credit = 0.0
+
+            prev_balance = balance
+
+            # -------------------------------------------------
+            # 4️⃣ DESCRIPTION (cleaned, multiline-safe)
+            # -------------------------------------------------
+            desc = line[len(m_date.group(1)):].strip()
+            for tok in money_raw:
+                desc = desc.replace(tok, "").strip()
 
             transactions.append({
                 "date": date,
                 "description": desc,
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
-                "balance": round(balance, 2) if balance is not None else None,
+                "balance": round(balance, 2),
                 "page": page_num,
                 "bank": "Bank Islam",
                 "source_file": source_file,
-                "format": "format2"
+                "format": "format2_balance_delta"
             })
 
     return transactions
