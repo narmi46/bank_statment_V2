@@ -193,16 +193,108 @@ def parse_bank_islam_format2(pdf, source_file):
 
     return transactions
 
+# =========================================================
+# BANK ISLAM – FORMAT 3 (eSTATEMENT, BALANCE-DELTA BASED)
+# =========================================================
+
+        import re
+        from datetime import datetime
+        
+        DATE_AT_START_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
+        BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
+        MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
+        
+        def _to_float(x):
+            return float(x.replace(",", ""))
+        
+        def _parse_date(d):
+            for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(d, fmt).date().isoformat()
+                except ValueError:
+                    pass
+            return None
+        
+        
+        def parse_bank_islam_format3(pdf, source_file):
+            transactions = []
+        
+            prev_balance = None
+        
+            for page_num, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text() or ""
+                lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+        
+                for line in lines:
+                    upper = line.upper()
+        
+                    # -----------------------------
+                    # 1️⃣ BAL B/F
+                    # -----------------------------
+                    if BAL_BF_RE.search(upper):
+                        nums = MONEY_RE.findall(line)
+                        if nums:
+                            prev_balance = _to_float(nums[-1])
+                        continue
+        
+                    # -----------------------------
+                    # 2️⃣ TRANSACTION LINE
+                    # -----------------------------
+                    m_date = DATE_AT_START_RE.match(line)
+                    if not m_date or prev_balance is None:
+                        continue
+        
+                    date = _parse_date(m_date.group(1))
+                    if not date:
+                        continue
+        
+                    nums = MONEY_RE.findall(line)
+                    if not nums:
+                        continue
+        
+                    balance = _to_float(nums[-1])
+                    delta = round(balance - prev_balance, 2)
+        
+                    if delta > 0:
+                        credit = delta
+                        debit = 0.0
+                    else:
+                        debit = abs(delta)
+                        credit = 0.0
+        
+                    prev_balance = balance
+        
+                    # Clean description
+                    desc = line[len(m_date.group(1)):].strip()
+                    for n in nums:
+                        desc = desc.replace(n, "").strip()
+        
+                    transactions.append({
+                        "date": date,
+                        "description": desc,
+                        "debit": round(debit, 2),
+                        "credit": round(credit, 2),
+                        "balance": round(balance, 2),
+                        "page": page_num,
+                        "bank": "Bank Islam",
+                        "source_file": source_file,
+                        "format": "format3_estatement_balance_delta"
+                    })
+        
+            return transactions
+
 
 # =========================================================
 # WRAPPER (USED BY app.py)
 # =========================================================
-def parse_bank_islam(pdf, source_file):
-    """
-    Try FORMAT 1 first (table).
-    If nothing extracted, fallback to FORMAT 2 (text).
-    """
-    tx = parse_bank_islam_format1(pdf, source_file)
-    if tx:
-        return tx
-    return parse_bank_islam_format2(pdf, source_file)
+
+    def parse_bank_islam(pdf, source_file):
+        tx = parse_bank_islam_format1(pdf, source_file)
+        if tx:
+            return tx
+    
+        tx = parse_bank_islam_format2(pdf, source_file)
+        if tx:
+            return tx
+    
+        return parse_bank_islam_format3(pdf, source_file)
