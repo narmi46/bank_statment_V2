@@ -35,7 +35,7 @@ def parse_bank_islam_format1(pdf, source_file):
 
             try:
                 date = datetime.strptime(
-                    re.search(r"\d{2}/\d{2}/\d{4}", txn_date).group(),
+                    re.search(r"\d{2}/\d{2}/\d{4}", str(txn_date)).group(),
                     "%d/%m/%Y"
                 ).date().isoformat()
             except Exception:
@@ -77,14 +77,19 @@ def parse_bank_islam_format1(pdf, source_file):
 
 
 # =========================================================
-# BANK ISLAM – FORMAT 2 (TEXT / STATEMENT-BASED)
+# BANK ISLAM – FORMAT 2 (TEXT / STATEMENT-BASED)  ✅ FIXED
 # =========================================================
-AMOUNT_RE = re.compile(r"\(?-?[\d,]+(?:\.\d{1,2})?\)?")
-DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2,4})\b")
+
+# Only match amounts that look like money: must have .xx decimals
+MONEY_RE = re.compile(r"\(?-?[\d,]+\.\d{2}\)?")
+
+# Line must START with date (prevents "STATEMENT DATE : 30/11/24" in headers)
+DATE_AT_START_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{2,4})\b")
 
 def _to_float(val):
     if not val:
         return None
+    val = val.strip()
     neg = val.startswith("(") and val.endswith(")")
     val = val.strip("()").replace(",", "")
     try:
@@ -92,6 +97,17 @@ def _to_float(val):
         return -num if neg else num
     except ValueError:
         return None
+
+def _parse_date(d):
+    if not d:
+        return None
+    d = d.strip()
+    for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(d, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return None
 
 def parse_bank_islam_format2(pdf, source_file):
     transactions = []
@@ -101,42 +117,47 @@ def parse_bank_islam_format2(pdf, source_file):
         lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
 
         for line in lines:
-            m_date = DATE_RE.search(line)
+            upper = line.upper()
+
+            # 🔥 KEY FIX: ignore header lines that contain STATEMENT DATE
+            if "STATEMENT DATE" in upper:
+                continue
+
+            # 🔥 KEY FIX: only accept lines that START with a transaction date
+            m_date = DATE_AT_START_RE.search(line)
             if not m_date:
                 continue
 
-            try:
-                date = datetime.strptime(
-                    m_date.group(1),
-                    "%d/%m/%y" if len(m_date.group(1)) == 8 else "%d/%m/%Y"
-                ).date().isoformat()
-            except Exception:
+            date = _parse_date(m_date.group(1))
+            if not date:
                 continue
 
-            amounts_raw = AMOUNT_RE.findall(line)
-            amounts = [_to_float(a) for a in amounts_raw if _to_float(a) is not None]
+            # Extract only money-looking tokens (with .xx)
+            money_raw = MONEY_RE.findall(line)
+            money_vals = [_to_float(x) for x in money_raw]
+            money_vals = [x for x in money_vals if x is not None]
 
-            if not amounts:
+            # For Bank Islam statement rows, we usually expect:
+            #   <amount> <balance>
+            if len(money_vals) < 2:
                 continue
 
-            if len(amounts) >= 2:
-                amount = amounts[-2]
-                balance = amounts[-1]
-            else:
-                amount = amounts[-1]
-                balance = 0.0
+            amount = money_vals[-2]
+            balance = money_vals[-1]
 
-            desc = line.replace(m_date.group(1), "")
-            for a in amounts_raw[-2:]:
-                desc = desc.replace(a, "")
-            desc = desc.strip()
+            # Description: remove date + last two money tokens
+            desc = line[len(m_date.group(1)):].strip()
+            # remove only the last two occurrences safely
+            for tok in money_raw[-2:]:
+                desc = desc.replace(tok, "").strip()
 
             desc_upper = desc.upper()
             debit = credit = 0.0
 
+            # Decide debit/credit (simple heuristic)
             if amount < 0:
                 debit = abs(amount)
-            elif any(k in desc_upper for k in ["PROFIT", "CR", "CREDIT", "IN"]):
+            elif any(k in desc_upper for k in ["PROFIT", "CR", "CREDIT", "RECEIVED", "IN"]):
                 credit = amount
             else:
                 debit = amount
@@ -167,5 +188,4 @@ def parse_bank_islam(pdf, source_file):
     tx = parse_bank_islam_format1(pdf, source_file)
     if tx:
         return tx
-
     return parse_bank_islam_format2(pdf, source_file)
