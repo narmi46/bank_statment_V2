@@ -170,24 +170,25 @@ def parse_bank_islam_format2(pdf, source_file):
 # FORMAT 3 – eSTATEMENT (BALANCE DELTA, DIFFERENT LAYOUT)
 # =========================================================
 def parse_bank_islam_format3(pdf, source_file):
+    import re
+    from datetime import datetime
+
     transactions = []
     prev_balance = None
+    current = None
 
     DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
-    MONEY_RE3 = re.compile(r"[\d,]+\.\d{2}")
-    BAL_BF_RE3 = re.compile(r"BAL\s+B/F", re.IGNORECASE)
+    MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
+    BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
 
     def to_float(x):
-        try:
-            return float(x.replace(",", ""))
-        except Exception:
-            return None
+        return float(x.replace(",", ""))
 
     def parse_date(d):
         for fmt in ("%d/%m/%y", "%d/%m/%Y"):
             try:
-                return datetime.strptime(d.strip(), fmt).date().isoformat()
-            except Exception:
+                return datetime.strptime(d, fmt).date().isoformat()
+            except ValueError:
                 pass
         return None
 
@@ -198,48 +199,44 @@ def parse_bank_islam_format3(pdf, source_file):
         for line in lines:
             upper = line.upper()
 
-            if BAL_BF_RE3.search(upper):
-                nums = MONEY_RE3.findall(line)
+            # 1️⃣ OPENING BALANCE
+            if BAL_BF_RE.search(upper):
+                nums = MONEY_RE.findall(line)
                 if nums:
                     prev_balance = to_float(nums[-1])
                 continue
 
+            # 2️⃣ START NEW TRANSACTION (DATE LINE)
             m = DATE_RE.match(line)
-            if not m or prev_balance is None:
+            if m and prev_balance is not None:
+                current = {
+                    "date": parse_date(m.group(1)),
+                    "description": line[m.end():].strip(),  # ✅ FIRST LINE ONLY
+                    "page": page_num
+                }
                 continue
 
-            date = parse_date(m.group(1))
-            if not date:
-                continue
+            # 3️⃣ LOOK FOR BALANCE LINE
+            if current:
+                nums = MONEY_RE.findall(line)
+                if nums:
+                    balance = to_float(nums[-1])
+                    delta = round(balance - prev_balance, 2)
 
-            nums = MONEY_RE3.findall(line)
-            if not nums:
-                continue
+                    transactions.append({
+                        "date": current["date"],
+                        "description": current["description"],
+                        "debit": abs(delta) if delta < 0 else 0.0,
+                        "credit": delta if delta > 0 else 0.0,
+                        "balance": round(balance, 2),
+                        "page": current["page"],
+                        "bank": "Bank Islam",
+                        "source_file": source_file,
+                        "format": "format3_estatement"
+                    })
 
-            balance = to_float(nums[-1])
-            if balance is None:
-                continue
-
-            delta = round(balance - prev_balance, 2)
-            debit = abs(delta) if delta < 0 else 0.0
-            credit = delta if delta > 0 else 0.0
-            prev_balance = balance
-
-            desc = line[len(m.group(1)):].strip()
-            for n in nums:
-                desc = desc.replace(n, "").strip()
-
-            transactions.append({
-                "date": date,
-                "description": desc,
-                "debit": round(debit, 2),
-                "credit": round(credit, 2),
-                "balance": round(balance, 2),
-                "page": page_num,
-                "bank": "Bank Islam",
-                "source_file": source_file,
-                "format": "format3_estatement"
-            })
+                    prev_balance = balance
+                    current = None  # reset
 
     return transactions
 
