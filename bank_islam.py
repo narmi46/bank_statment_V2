@@ -240,6 +240,89 @@ def parse_bank_islam_format3(pdf, source_file):
 
     return transactions
 
+
+# =========================================================
+# FORMAT 4 – eSTATEMENT (BALANCE DELTA, DIFFERENT LAYOUT)
+# =========================================================
+
+
+def parse_bank_islam_format4(pdf, source_file):
+    import re
+    from datetime import datetime
+
+    transactions = []
+    prev_balance = None
+
+    # Matches "26/02/25" or "28/02/25"
+    DATE_RE = re.compile(r"^(\d{1,2}/\d{1,2}/\d{2,4})")
+    # Matches currency patterns like "1,000,000.00"
+    MONEY_RE = re.compile(r"(\d{1,3}(?:,\d{3})*\.\d{2})")
+    BAL_BF_RE = re.compile(r"BAL\s+B/IF", re.IGNORECASE)
+
+    def to_float(x):
+        return float(x.replace(",", ""))
+
+    def parse_date(d):
+        for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(d, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return None
+
+    for page_num, page in enumerate(pdf.pages, start=1):
+        # Using x_tolerance=1 as established for your normalized text
+        text = page.extract_text(x_tolerance=1) or ""
+        lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+
+    for line in lines:
+        # 1. Capture Opening Balance (Note the extra 'I' in 'B/IF' from your OCR)
+        if BAL_BF_RE.search(line):
+            nums = MONEY_RE.findall(line)
+            if nums:
+                prev_balance = to_float(nums[-1])
+            continue
+
+        # 2. Extract Date-initiated lines
+        date_match = DATE_RE.match(line)
+        if date_match and prev_balance is not None:
+            raw_date = date_match.group(1)
+            nums = MONEY_RE.findall(line)
+            
+            if nums:
+                # The last number is ALWAYS the Balance
+                current_balance = to_float(nums[-1])
+                
+                # The first number (if there are multiple) is the Transaction Amount
+                # If only one number exists on the line, it's just the balance (rare but possible)
+                tx_amount = to_float(nums[0]) if len(nums) >= 2 else 0.0
+                
+                # Calculate delta to verify if it's Debit or Credit
+                delta = round(current_balance - prev_balance, 2)
+                
+                # Clean description: Remove date and all detected money values
+                desc = line.replace(raw_date, "").strip()
+                for n in nums:
+                    desc = desc.replace(n, "").strip()
+
+                transactions.append({
+                    "date": parse_date(raw_date),
+                    "description": desc,
+                    "debit": abs(delta) if delta < 0 else 0.0,
+                    "credit": delta if delta > 0 else 0.0,
+                    "balance": current_balance,
+                    "page": page_num,
+                    "bank": "Bank Islam",
+                    "source_file": source_file,
+                    "format": "format4_normalized"
+                })
+                
+                # Update anchor for next row
+                prev_balance = current_balance
+
+    return transactions
+
+
 # =========================================================
 # WRAPPER
 # =========================================================
@@ -252,4 +335,8 @@ def parse_bank_islam(pdf, source_file):
     if tx:
         return tx
 
-    return parse_bank_islam_format3(pdf, source_file)
+        tx = parse_bank_islam_format3(pdf, source_file)
+    if tx:
+        return tx
+
+    return parse_bank_islam_format4(pdf, source_file)
