@@ -15,12 +15,13 @@ from cimb import parse_transactions_cimb
 from bank_islam import parse_bank_islam
 from bank_rakyat import parse_bank_rakyat
 
+
 # ---------------------------------------------------
 # NEW BANK PARSERS (ADDED ONLY)
 # ---------------------------------------------------
 
 from bank_muamalat import parse_transactions_bank_muamalat
-
+from affin_bank import parse_affin_bank
 
 # ---------------------------------------------------
 # Streamlit Setup
@@ -51,7 +52,8 @@ bank_choice = st.selectbox(
         "RHB Bank",
         "CIMB Bank",
         "Bank Islam",
-        "Bank Rakyat",       # ✅ NEW
+        "Bank Rakyat",
+        "Affin Bank",        # ✅ NEW
         "Bank Muamalat"      # ✅ NEW
     ]
 )
@@ -143,9 +145,12 @@ if uploaded_files and st.session_state.status == "running":
                 # ---------------------------------------------------
                 # NEW BANKS (ADDED ONLY)
                 # ---------------------------------------------------
-    
+
                 elif bank_choice == "Bank Muamalat":
                     tx = parse_transactions_bank_muamalat(pdf, uploaded_file.name)
+                
+                elif bank_choice == "Affin Bank":
+                    tx = parse_affin_bank(pdf, uploaded_file.name)
 
                 if tx:
                     st.success(f"✅ Extracted {len(tx)} transactions from {uploaded_file.name}")
