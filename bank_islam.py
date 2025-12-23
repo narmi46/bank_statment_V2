@@ -2,12 +2,12 @@ import re
 from datetime import datetime
 
 # =========================================================
-# HELPERS
+# COMMON HELPERS
 # =========================================================
 
-MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
 DATE_AT_START_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
 BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
+MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
 
 
 def to_float(x):
@@ -23,11 +23,11 @@ def parse_date(d):
     return None
 
 
-    # =========================================================
-    # FORMAT 1 – TABLE (fallback, unchanged logic)
-    # =========================================================
+# =========================================================
+# FORMAT 1 – TABLE BASED (LEGACY / OPTIONAL)
+# =========================================================
 def parse_bank_islam_format1(pdf, source_file):
-    tx = []
+    transactions = []
 
     for page_num, page in enumerate(pdf.pages, start=1):
         table = page.extract_table()
@@ -46,45 +46,50 @@ def parse_bank_islam_format1(pdf, source_file):
             credit = to_float(row[3]) if row[3] else 0.0
             balance = to_float(row[4]) if row[4] else None
 
-            tx.append({
+            desc = " ".join(str(x) for x in row[1:] if x)
+
+            transactions.append({
                 "date": date,
-                "description": " ".join(str(x) for x in row[1:] if x),
+                "description": desc,
                 "debit": debit,
                 "credit": credit,
                 "balance": balance,
                 "page": page_num,
                 "bank": "Bank Islam",
                 "source_file": source_file,
-                "format": "format1"
+                "format": "format1_table"
             })
 
-    return tx
+    return transactions
 
 
 # =========================================================
-# FORMAT 2 – TEXT (BALANCE DELTA)
+# FORMAT 2 – TEXT STATEMENT (BALANCE DELTA)
 # =========================================================
 def parse_bank_islam_format2(pdf, source_file):
-    tx = []
+    transactions = []
     prev_balance = None
 
     for page_num, page in enumerate(pdf.pages, start=1):
-        lines = (page.extract_text() or "").splitlines()
+        text = page.extract_text() or ""
+        lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
 
         for line in lines:
-            line = re.sub(r"\s+", " ", line).strip()
+            upper = line.upper()
 
-            if BAL_BF_RE.search(line):
+            # Opening balance
+            if BAL_BF_RE.search(upper):
                 nums = MONEY_RE.findall(line)
                 if nums:
                     prev_balance = to_float(nums[-1])
                 continue
 
-            m = DATE_AT_START_RE.match(line)
-            if not m or prev_balance is None:
+            # Transaction line
+            m_date = DATE_AT_START_RE.match(line)
+            if not m_date or prev_balance is None:
                 continue
 
-            date = parse_date(m.group(1))
+            date = parse_date(m_date.group(1))
             if not date:
                 continue
 
@@ -99,34 +104,82 @@ def parse_bank_islam_format2(pdf, source_file):
             credit = delta if delta > 0 else 0.0
             prev_balance = balance
 
-            desc = line[len(m.group(1)):].strip()
+            desc = line[len(m_date.group(1)):].strip()
             for n in nums:
                 desc = desc.replace(n, "").strip()
 
-            tx.append({
+            transactions.append({
                 "date": date,
                 "description": desc,
-                "debit": debit,
-                "credit": credit,
-                "balance": balance,
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2),
                 "page": page_num,
                 "bank": "Bank Islam",
                 "source_file": source_file,
-                "format": "format2"
+                "format": "format2_balance_delta"
             })
 
-    return tx
+    return transactions
 
 
 # =========================================================
-# FORMAT 3 – eSTATEMENT (BALANCE DELTA)
+# FORMAT 3 – eSTATEMENT (BALANCE DELTA, DIFFERENT LAYOUT)
 # =========================================================
 def parse_bank_islam_format3(pdf, source_file):
-    # identical logic, separate format label
-    tx = parse_bank_islam_format2(pdf, source_file)
-    for t in tx:
-        t["format"] = "format3_estatement"
-    return tx
+    transactions = []
+    prev_balance = None
+
+    for page_num, page in enumerate(pdf.pages, start=1):
+        text = page.extract_text() or ""
+        lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+
+        for line in lines:
+            upper = line.upper()
+
+            # Opening balance
+            if BAL_BF_RE.search(upper):
+                nums = MONEY_RE.findall(line)
+                if nums:
+                    prev_balance = to_float(nums[-1])
+                continue
+
+            m_date = DATE_AT_START_RE.match(line)
+            if not m_date or prev_balance is None:
+                continue
+
+            date = parse_date(m_date.group(1))
+            if not date:
+                continue
+
+            nums = MONEY_RE.findall(line)
+            if not nums:
+                continue
+
+            balance = to_float(nums[-1])
+            delta = round(balance - prev_balance, 2)
+
+            debit = abs(delta) if delta < 0 else 0.0
+            credit = delta if delta > 0 else 0.0
+            prev_balance = balance
+
+            desc = line[len(m_date.group(1)):].strip()
+            for n in nums:
+                desc = desc.replace(n, "").strip()
+
+            transactions.append({
+                "date": date,
+                "description": desc,
+                "debit": round(debit, 2),
+                "credit": round(credit, 2),
+                "balance": round(balance, 2),
+                "page": page_num,
+                "bank": "Bank Islam",
+                "source_file": source_file,
+                "format": "format3_estatement"
+            })
+
+    return transactions
 
 
 # =========================================================
@@ -134,15 +187,16 @@ def parse_bank_islam_format3(pdf, source_file):
 # =========================================================
 def parse_bank_islam(pdf, source_file):
     """
-    This is what app.py imports.
-    Order matters.
+    Try all 3 formats, in order.
+    This function MUST exist for app.py.
     """
-    tx = parse_bank_islam_format1(pdf, source_file)
-    if tx:
-        return tx
 
-    tx = parse_bank_islam_format2(pdf, source_file)
-    if tx:
-        return tx
+    tx1 = parse_bank_islam_format1(pdf, source_file)
+    if tx1:
+        return tx1
+
+    tx2 = parse_bank_islam_format2(pdf, source_file)
+    if tx2:
+        return tx2
 
     return parse_bank_islam_format3(pdf, source_file)
