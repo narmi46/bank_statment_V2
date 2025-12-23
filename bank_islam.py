@@ -2,32 +2,24 @@ import re
 from datetime import datetime
 
 # =========================================================
-# COMMON HELPERS
-# =========================================================
-
-DATE_AT_START_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
-BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
-MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
-
-
-def to_float(x):
-    return float(x.replace(",", ""))
-
-
-def parse_date(d):
-    for fmt in ("%d/%m/%y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(d.strip(), fmt).date().isoformat()
-        except ValueError:
-            pass
-    return None
-
-
-# =========================================================
-# FORMAT 1 – TABLE BASED (LEGACY / OPTIONAL)
+# FORMAT 1 – TABLE BASED (LEGACY)
 # =========================================================
 def parse_bank_islam_format1(pdf, source_file):
     transactions = []
+
+    def to_float(x):
+        try:
+            return float(str(x).replace(",", ""))
+        except Exception:
+            return None
+
+    def parse_date(d):
+        for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+            try:
+                return datetime.strptime(d.strip(), fmt).date().isoformat()
+            except Exception:
+                pass
+        return None
 
     for page_num, page in enumerate(pdf.pages, start=1):
         table = page.extract_table()
@@ -64,11 +56,29 @@ def parse_bank_islam_format1(pdf, source_file):
 
 
 # =========================================================
-# FORMAT 2 – TEXT STATEMENT (BALANCE DELTA)
+# FORMAT 2 – TEXT STATEMENT (BALANCE DELTA BASED)
 # =========================================================
 def parse_bank_islam_format2(pdf, source_file):
     transactions = []
     prev_balance = None
+
+    DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
+    MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
+    BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
+
+    def to_float(x):
+        try:
+            return float(x.replace(",", ""))
+        except Exception:
+            return None
+
+    def parse_date(d):
+        for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(d.strip(), fmt).date().isoformat()
+            except Exception:
+                pass
+        return None
 
     for page_num, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
@@ -84,12 +94,11 @@ def parse_bank_islam_format2(pdf, source_file):
                     prev_balance = to_float(nums[-1])
                 continue
 
-            # Transaction line
-            m_date = DATE_AT_START_RE.match(line)
-            if not m_date or prev_balance is None:
+            m = DATE_RE.match(line)
+            if not m or prev_balance is None:
                 continue
 
-            date = parse_date(m_date.group(1))
+            date = parse_date(m.group(1))
             if not date:
                 continue
 
@@ -104,7 +113,7 @@ def parse_bank_islam_format2(pdf, source_file):
             credit = delta if delta > 0 else 0.0
             prev_balance = balance
 
-            desc = line[len(m_date.group(1)):].strip()
+            desc = line[len(m.group(1)):].strip()
             for n in nums:
                 desc = desc.replace(n, "").strip()
 
@@ -130,6 +139,24 @@ def parse_bank_islam_format3(pdf, source_file):
     transactions = []
     prev_balance = None
 
+    DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
+    MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
+    BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
+
+    def to_float(x):
+        try:
+            return float(x.replace(",", ""))
+        except Exception:
+            return None
+
+    def parse_date(d):
+        for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(d.strip(), fmt).date().isoformat()
+            except Exception:
+                pass
+        return None
+
     for page_num, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
         lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
@@ -137,18 +164,17 @@ def parse_bank_islam_format3(pdf, source_file):
         for line in lines:
             upper = line.upper()
 
-            # Opening balance
             if BAL_BF_RE.search(upper):
                 nums = MONEY_RE.findall(line)
                 if nums:
                     prev_balance = to_float(nums[-1])
                 continue
 
-            m_date = DATE_AT_START_RE.match(line)
-            if not m_date or prev_balance is None:
+            m = DATE_RE.match(line)
+            if not m or prev_balance is None:
                 continue
 
-            date = parse_date(m_date.group(1))
+            date = parse_date(m.group(1))
             if not date:
                 continue
 
@@ -163,7 +189,7 @@ def parse_bank_islam_format3(pdf, source_file):
             credit = delta if delta > 0 else 0.0
             prev_balance = balance
 
-            desc = line[len(m_date.group(1)):].strip()
+            desc = line[len(m.group(1)):].strip()
             for n in nums:
                 desc = desc.replace(n, "").strip()
 
@@ -183,20 +209,18 @@ def parse_bank_islam_format3(pdf, source_file):
 
 
 # =========================================================
-# PUBLIC ENTRY POINT (USED BY app.py)
+# PUBLIC ENTRY POINT (REQUIRED BY app.py)
 # =========================================================
 def parse_bank_islam(pdf, source_file):
     """
-    Try all 3 formats, in order.
-    This function MUST exist for app.py.
+    Try Format 1 → Format 2 → Format 3
     """
+    tx = parse_bank_islam_format1(pdf, source_file)
+    if tx:
+        return tx
 
-    tx1 = parse_bank_islam_format1(pdf, source_file)
-    if tx1:
-        return tx1
-
-    tx2 = parse_bank_islam_format2(pdf, source_file)
-    if tx2:
-        return tx2
+    tx = parse_bank_islam_format2(pdf, source_file)
+    if tx:
+        return tx
 
     return parse_bank_islam_format3(pdf, source_file)
