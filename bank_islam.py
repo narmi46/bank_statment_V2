@@ -285,16 +285,19 @@ def parse_bank_islam_format2(pdf, source_file):
 
 
 # =========================================================
-# WRAPPER (USED BY app.py)
+# PUBLIC ENTRY POINT (USED BY app.py)
 # =========================================================
+def parse_bank_islam(pdf, source_file):
+    """
+    This is what app.py imports.
+    Order matters.
+    """
+    tx = parse_bank_islam_format1(pdf, source_file)
+    if tx:
+        return tx
 
-    def parse_bank_islam(pdf, source_file):
-        tx = parse_bank_islam_format1(pdf, source_file)
-        if tx:
-            return tx
-    
-        tx = parse_bank_islam_format2(pdf, source_file)
-        if tx:
-            return tx
-    
-        return parse_bank_islam_format3(pdf, source_file)
+    tx = parse_bank_islam_format2(pdf, source_file)
+    if tx:
+        return tx
+
+    return parse_bank_islam_format3(pdf, source_file)
