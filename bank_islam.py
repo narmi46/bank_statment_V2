@@ -193,6 +193,82 @@ def parse_bank_islam_format2(pdf, source_file):
 
     return transactions
 
+    # =========================================================
+    # FORMAT 3 – eSTATEMENT (BALANCE DELTA, DIFFERENT LAYOUT)
+    # =========================================================
+    def parse_bank_islam_format3(pdf, source_file):
+        transactions = []
+        prev_balance = None
+    
+        DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{2,4})\b")
+        MONEY_RE = re.compile(r"[\d,]+\.\d{2}")
+        BAL_BF_RE = re.compile(r"BAL\s+B/F", re.IGNORECASE)
+    
+        def to_float(x):
+            try:
+                return float(x.replace(",", ""))
+            except Exception:
+                return None
+    
+        def parse_date(d):
+            for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(d.strip(), fmt).date().isoformat()
+                except Exception:
+                    pass
+            return None
+    
+        for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+    
+            for line in lines:
+                upper = line.upper()
+    
+                if BAL_BF_RE.search(upper):
+                    nums = MONEY_RE.findall(line)
+                    if nums:
+                        prev_balance = to_float(nums[-1])
+                    continue
+    
+                m = DATE_RE.match(line)
+                if not m or prev_balance is None:
+                    continue
+    
+                date = parse_date(m.group(1))
+                if not date:
+                    continue
+    
+                nums = MONEY_RE.findall(line)
+                if not nums:
+                    continue
+    
+                balance = to_float(nums[-1])
+                delta = round(balance - prev_balance, 2)
+    
+                debit = abs(delta) if delta < 0 else 0.0
+                credit = delta if delta > 0 else 0.0
+                prev_balance = balance
+    
+                desc = line[len(m.group(1)):].strip()
+                for n in nums:
+                    desc = desc.replace(n, "").strip()
+    
+                transactions.append({
+                    "date": date,
+                    "description": desc,
+                    "debit": round(debit, 2),
+                    "credit": round(credit, 2),
+                    "balance": round(balance, 2),
+                    "page": page_num,
+                    "bank": "Bank Islam",
+                    "source_file": source_file,
+                    "format": "format3_estatement"
+                })
+    
+        return transactions
+
+
 
 # =========================================================
 # WRAPPER (USED BY app.py)
@@ -205,4 +281,9 @@ def parse_bank_islam(pdf, source_file):
     tx = parse_bank_islam_format1(pdf, source_file)
     if tx:
         return tx
-    return parse_bank_islam_format2(pdf, source_file)
+
+    tx = parse_bank_islam_format2(pdf, source_file)
+    if tx:
+        return tx
+
+    return parse_bank_islam_format3(pdf, source_file)
