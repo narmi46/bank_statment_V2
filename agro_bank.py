@@ -7,13 +7,12 @@ ZERO_RE = re.compile(r"^0?\.00-?$")
 
 
 # -------------------------------------------------
-# Extract TOTAL DEBIT / TOTAL CREDIT from PDF
+# Extract TOTAL DEBIT / TOTAL CREDIT (PDF Summary)
 # -------------------------------------------------
 def extract_agrobank_summary_totals(pdf):
     total_debit = None
     total_credit = None
 
-    # Agrobank summary is always near the end
     for page in reversed(pdf.pages):
         text = page.extract_text() or ""
 
@@ -37,37 +36,30 @@ def extract_agrobank_summary_totals(pdf):
 
 
 # -------------------------------------------------
-# MAIN PARSER (MANDATED FUNCTION NAME)
+# MAIN PARSER
 # -------------------------------------------------
 def parse_agro_bank(pdf, source_file):
     """
-    Agrobank statement parser
+    Agrobank parser
 
-    Features:
-    - Date anchor + same-line grouping
-    - Right-most amount = balance
-    - Debit / Credit inferred by balance delta
-    - Handles trailing '-' debit format
-    - Overdraft-safe
-    - ISO date output
-    - Cross-checks TOTAL DEBIT / TOTAL CREDIT
-    - Marks transactions with '#' on mismatch
+    Opening / Closing balance:
+    - extracted
+    - NOT included as transactions
     """
 
     transactions = []
     previous_balance = None
 
-    # Extract official summary totals
+    opening_balance = None
+    opening_balance_date = None
+    closing_balance = None
+    closing_balance_date = None
+
     summary_debit, summary_credit = extract_agrobank_summary_totals(pdf)
 
     for page_num, page in enumerate(pdf.pages, start=1):
 
-        words = page.extract_words(
-            use_text_flow=True,
-            keep_blank_chars=False
-        )
-
-        # Visual order: top → bottom, left → right
+        words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
         words = sorted(words, key=lambda w: (w["top"], w["x0"]))
 
         i = 0
@@ -75,21 +67,11 @@ def parse_agro_bank(pdf, source_file):
 
             text = words[i]["text"]
 
-            # -------------------------
-            # DATE ANCHOR
-            # -------------------------
             if DATE_RE.fullmatch(text):
 
                 y_ref = words[i]["top"]
+                same_line = [w for w in words if abs(w["top"] - y_ref) <= 2]
 
-                same_line = [
-                    w for w in words
-                    if abs(w["top"] - y_ref) <= 2
-                ]
-
-                # -------------------------
-                # DESCRIPTION
-                # -------------------------
                 description = " ".join(
                     w["text"] for w in same_line
                     if not DATE_RE.fullmatch(w["text"])
@@ -97,14 +79,10 @@ def parse_agro_bank(pdf, source_file):
                     and not ZERO_RE.fullmatch(w["text"])
                 ).strip()
 
-                # -------------------------
-                # AMOUNTS
-                # -------------------------
                 amounts = [
                     (w["x0"], w["text"])
                     for w in same_line
                     if AMOUNT_RE.fullmatch(w["text"])
-                    and not ZERO_RE.fullmatch(w["text"])
                 ]
 
                 if not amounts:
@@ -119,78 +97,83 @@ def parse_agro_bank(pdf, source_file):
                         return -float(val[:-1])
                     return float(val)
 
-                # Agrobank invariant:
-                # Right-most amount = balance
-                current_balance = to_float(amounts[-1][1])
+                balance = to_float(amounts[-1][1])
+                iso_date = datetime.strptime(text, "%d/%m/%y").strftime("%Y-%m-%d")
 
-                txn_amount = None
-                if len(amounts) > 1:
-                    txn_amount = to_float(amounts[-2][1])
+                desc_upper = description.upper()
 
+                # -------------------------
+                # OPENING BALANCE
+                # -------------------------
+                if "BEGINNING BALANCE" in desc_upper:
+                    opening_balance = balance
+                    opening_balance_date = iso_date
+                    previous_balance = balance
+                    i += 1
+                    continue
+
+                # -------------------------
+                # CLOSING BALANCE
+                # -------------------------
+                if "CLOSING BALANCE" in desc_upper:
+                    closing_balance = balance
+                    closing_balance_date = iso_date
+                    i += 1
+                    continue
+
+                # -------------------------
+                # NORMAL TRANSACTION
+                # -------------------------
                 debit = credit = None
 
-                # -------------------------
-                # DEBIT / CREDIT LOGIC
-                # -------------------------
                 if previous_balance is not None:
-                    delta = current_balance - previous_balance
-
+                    delta = balance - previous_balance
                     if delta > 0.0001:
                         credit = abs(delta)
                     elif delta < -0.0001:
                         debit = abs(delta)
-                else:
-                    # First row fallback
-                    if txn_amount is not None:
-                        if txn_amount < 0:
-                            debit = abs(txn_amount)
-                        else:
-                            credit = txn_amount
-
-                # -------------------------
-                # ISO DATE OUTPUT
-                # -------------------------
-                iso_date = datetime.strptime(
-                    text, "%d/%m/%y"
-                ).strftime("%Y-%m-%d")
 
                 transactions.append({
                     "date": iso_date,
                     "description": description,
                     "debit": debit,
                     "credit": credit,
-                    "balance": current_balance,
+                    "balance": balance,
                     "page": page_num,
                     "bank": "Agrobank",
                     "source_file": source_file
                 })
 
-                previous_balance = current_balance
+                previous_balance = balance
 
             i += 1
 
     # -------------------------------------------------
     # SUMMARY VALIDATION
     # -------------------------------------------------
-    computed_debit = round(
-        sum(t["debit"] or 0 for t in transactions), 2
-    )
-    computed_credit = round(
-        sum(t["credit"] or 0 for t in transactions), 2
-    )
+    computed_debit = round(sum(t["debit"] or 0 for t in transactions), 2)
+    computed_credit = round(sum(t["credit"] or 0 for t in transactions), 2)
 
-    summary_mismatch = False
+    mismatch = False
+    if summary_debit is not None and abs(computed_debit - summary_debit) > 0.01:
+        mismatch = True
+    if summary_credit is not None and abs(computed_credit - summary_credit) > 0.01:
+        mismatch = True
 
-    if summary_debit is not None:
-        if abs(computed_debit - summary_debit) > 0.01:
-            summary_mismatch = True
-
-    if summary_credit is not None:
-        if abs(computed_credit - summary_credit) > 0.01:
-            summary_mismatch = True
-
-    # Mark all rows if mismatch
     for t in transactions:
-        t["summary_check"] = "#" if summary_mismatch else ""
+        t["summary_check"] = "#" if mismatch else ""
 
-    return transactions
+    # -------------------------------------------------
+    # OPTIONAL METADATA ATTACHMENT
+    # -------------------------------------------------
+    metadata = {
+        "opening_balance": opening_balance,
+        "opening_balance_date": opening_balance_date,
+        "closing_balance": closing_balance,
+        "closing_balance_date": closing_balance_date,
+        "summary_debit_pdf": summary_debit,
+        "summary_credit_pdf": summary_credit,
+        "summary_mismatch": mismatch,
+    }
+
+    return transactions, metadata
