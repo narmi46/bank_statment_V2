@@ -22,6 +22,7 @@ from bank_rakyat import parse_bank_rakyat
 
 from bank_muamalat import parse_transactions_bank_muamalat
 from affin_bank import parse_affin_bank
+from agro_bank import parse_agro_bank
 
 # ---------------------------------------------------
 # Streamlit Setup
@@ -55,6 +56,7 @@ bank_choice = st.selectbox(
         "Bank Rakyat",
         "Affin Bank",        # ✅ NEW
         "Bank Muamalat"      # ✅ NEW
+        "Agro Bank"      # ✅ NEW
     ]
 )
 
@@ -148,6 +150,9 @@ if uploaded_files and st.session_state.status == "running":
 
                 elif bank_choice == "Bank Muamalat":
                     tx = parse_transactions_bank_muamalat(pdf, uploaded_file.name)
+
+                elif bank_choice == "Agro Bank":
+                    tx = parse_transactions_agro_bank(pdf, uploaded_file.name)
                 
                 elif bank_choice == "Affin Bank":
                     tx = parse_affin_bank(pdf, uploaded_file.name)
