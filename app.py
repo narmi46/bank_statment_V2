@@ -55,7 +55,7 @@ bank_choice = st.selectbox(
         "Bank Islam",
         "Bank Rakyat",
         "Affin Bank",        # ✅ NEW
-        "Bank Muamalat"      # ✅ NEW
+        "Bank Muamalat",      # ✅ NEW
         "Agro Bank"      # ✅ NEW
     ]
 )
