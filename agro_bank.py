@@ -8,7 +8,7 @@ AMOUNT_RE = re.compile(r"(?:\d{1,3}(?:,\d{3})*|\d+)?\.\d{2}")
 ZERO_RE = re.compile(r"^0?\.00$")
 
 
-def parse_transactions_agro_bank(pdf, source_file):
+def parse_agro_bank(pdf, source_file):
     """
     Bank Muamalat parser.
 
