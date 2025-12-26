@@ -6,9 +6,6 @@ AMOUNT_RE = re.compile(r"\d{1,3}(?:,\d{3})*\.\d{2}-?")
 ZERO_RE = re.compile(r"^0?\.00-?$")
 
 
-# -------------------------------------------------
-# Extract TOTAL DEBIT / TOTAL CREDIT (PDF Summary)
-# -------------------------------------------------
 def extract_agrobank_summary_totals(pdf):
     total_debit = None
     total_credit = None
@@ -35,25 +32,15 @@ def extract_agrobank_summary_totals(pdf):
     return total_debit, total_credit
 
 
-# -------------------------------------------------
-# MAIN PARSER
-# -------------------------------------------------
 def parse_agro_bank(pdf, source_file):
     """
     Agrobank parser
-
-    Opening / Closing balance:
-    - extracted
-    - NOT included as transactions
+    - Opening / Closing balance extracted but NOT returned as transactions
+    - Fully compatible with existing app.py
     """
 
     transactions = []
     previous_balance = None
-
-    opening_balance = None
-    opening_balance_date = None
-    closing_balance = None
-    closing_balance_date = None
 
     summary_debit, summary_credit = extract_agrobank_summary_totals(pdf)
 
@@ -91,54 +78,46 @@ def parse_agro_bank(pdf, source_file):
 
                 amounts.sort(key=lambda x: x[0])
 
-                def to_float(val):
-                    val = val.replace(",", "")
-                    if val.endswith("-"):
-                        return -float(val[:-1])
-                    return float(val)
+                def to_float(v):
+                    v = v.replace(",", "")
+                    if v.endswith("-"):
+                        return -float(v[:-1])
+                    return float(v)
 
                 balance = to_float(amounts[-1][1])
                 iso_date = datetime.strptime(text, "%d/%m/%y").strftime("%Y-%m-%d")
-
                 desc_upper = description.upper()
 
-                # -------------------------
-                # OPENING BALANCE
-                # -------------------------
+                # -------------------------------------------------
+                # 🚫 HARD STOP: OPENING / CLOSING BALANCE
+                # -------------------------------------------------
                 if "BEGINNING BALANCE" in desc_upper:
-                    opening_balance = balance
-                    opening_balance_date = iso_date
                     previous_balance = balance
                     i += 1
                     continue
 
-                # -------------------------
-                # CLOSING BALANCE
-                # -------------------------
                 if "CLOSING BALANCE" in desc_upper:
-                    closing_balance = balance
-                    closing_balance_date = iso_date
                     i += 1
                     continue
 
-                # -------------------------
+                # -------------------------------------------------
                 # NORMAL TRANSACTION
-                # -------------------------
+                # -------------------------------------------------
                 debit = credit = None
 
                 if previous_balance is not None:
                     delta = balance - previous_balance
                     if delta > 0.0001:
-                        credit = abs(delta)
+                        credit = round(delta, 2)
                     elif delta < -0.0001:
-                        debit = abs(delta)
+                        debit = round(abs(delta), 2)
 
                 transactions.append({
                     "date": iso_date,
                     "description": description,
                     "debit": debit,
                     "credit": credit,
-                    "balance": balance,
+                    "balance": round(balance, 2),
                     "page": page_num,
                     "bank": "Agrobank",
                     "source_file": source_file
@@ -163,17 +142,4 @@ def parse_agro_bank(pdf, source_file):
     for t in transactions:
         t["summary_check"] = "#" if mismatch else ""
 
-    # -------------------------------------------------
-    # OPTIONAL METADATA ATTACHMENT
-    # -------------------------------------------------
-    metadata = {
-        "opening_balance": opening_balance,
-        "opening_balance_date": opening_balance_date,
-        "closing_balance": closing_balance,
-        "closing_balance_date": closing_balance_date,
-        "summary_debit_pdf": summary_debit,
-        "summary_credit_pdf": summary_credit,
-        "summary_mismatch": mismatch,
-    }
-
-    return transactions, metadata
+    return transactions
