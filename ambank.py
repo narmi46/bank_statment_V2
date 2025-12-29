@@ -1,85 +1,63 @@
-import re
 import pdfplumber
-from datetime import datetime
+import re
 
-DATE_RE = re.compile(r"^(\d{2}[A-Za-z]{3})\s+(.*)$")
-BALANCE_RE = re.compile(r"(\d{1,3}(?:,\d{3})*\.\d{2})$")
+def parse_ambank(pdf, filename):
+    """
+    Parses AmBank Islamic bank statements.
+    Target Columns: Date, Transaction, Cheque No, Debit, Credit, Balance
+    """
+    transactions = []
+    
+    # Process pages that contain transaction tables (typically pages 1-6)
+    # The provided document has transaction data from page 1 to 6 [cite: 15, 89]
+    for page_idx, page in enumerate(pdf.pages):
+        # Extract tables using horizontal and vertical line strategies
+        # AmBank statements use clear lines for their tables [cite: 15, 22, 36]
+        tables = page.extract_table({
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "snap_tolerance": 3,
+        })
+        
+        if not tables:
+            # Fallback for pages where lines might not be perfectly detected
+            tables = page.extract_table()
 
-OPENING_BALANCE_RE = re.compile(
-    r"OPENING BALANCE.*?([\d,]+\.\d{2})", re.IGNORECASE
-)
-
-STATEMENT_YEAR_RE = re.compile(
-    r"STATEMENT DATE.*?\d{2}/\d{2}/(\d{4})", re.IGNORECASE
-)
-
-def parse_ambank(pdf_input, source_file: str = ""):
-    bank_name = "AmBank"
-    tx = []
-
-    with pdfplumber.open(pdf_input) as pdf:
-        first_page_text = pdf.pages[0].extract_text() or ""
-
-        year = int(STATEMENT_YEAR_RE.search(first_page_text).group(1))
-        opening_balance = float(
-            OPENING_BALANCE_RE.search(first_page_text).group(1).replace(",", "")
-        )
-
-        prev_balance = opening_balance
-
-        for page_idx, page in enumerate(pdf.pages, start=1):
-            lines = page.extract_text().splitlines()
-
-            for ln in lines:
-                ln = ln.strip()
-                if not ln:
+        if tables:
+            for row in tables:
+                # Clean the row data
+                clean_row = [str(cell).strip() if cell else "" for cell in row]
+                
+                # Validation: Skip header rows or summary rows 
+                # Headers usually contain 'DATE', 'TRANSACTION', or 'BALANCE' [cite: 15]
+                if "DATE" in clean_row[0].upper() or "TARIKH" in clean_row[0].upper():
                     continue
-
-                date_match = DATE_RE.match(ln)
-                if not date_match:
+                if "OPENING BALANCE" in clean_row[1].upper() or "TOTAL DEBITS" in clean_row[1].upper():
                     continue
-
-                date_raw, rest = date_match.groups()
-
-                if re.search(r"balance b/f|baki bawa", rest, re.IGNORECASE):
+                if "BALANCE BAWA KE HADAPAN" in clean_row[1].upper() or "Baki Bawa Ke Hadapan" in clean_row[1]:
                     continue
+                
+                # Ensure the row has enough columns (AmBank uses 6) 
+                if len(clean_row) >= 6:
+                    date = clean_row[0]
+                    description = clean_row[1].replace('\n', ' ')
+                    cheque_no = clean_row[2]
+                    debit = clean_row[3].replace(',', '')
+                    credit = clean_row[4].replace(',', '')
+                    balance = clean_row[5].replace(',', '')
 
-                bal_match = BALANCE_RE.search(ln)
-                if not bal_match:
-                    continue
-
-                balance = float(bal_match.group(1).replace(",", ""))
-
-                delta = round(balance - prev_balance, 2)
-                if delta == 0:
-                    continue  # ignore noise
-
-                debit = credit = 0.0
-                if delta > 0:
-                    credit = delta
-                else:
-                    debit = abs(delta)
-
-                try:
-                    date_norm = datetime.strptime(
-                        f"{date_raw}{year}", "%d%b%Y"
-                    ).strftime("%Y-%m-%d")
-                except Exception:
-                    date_norm = date_raw
-
-                description = rest.strip()
-
-                tx.append({
-                    "date": date_norm,
-                    "description": description,
-                    "debit": debit,
-                    "credit": credit,
-                    "balance": balance,
-                    "page": page_idx,
-                    "bank": bank_name,
-                    "source_file": source_file
-                })
-
-                prev_balance = balance
-
-    return tx
+                    # Final check: A valid transaction usually has a date and a description 
+                    if date and description:
+                        transactions.append({
+                            "date": date,
+                            "description": description,
+                            "cheque_no": cheque_no,
+                            "debit": debit if debit else "0.00",
+                            "credit": credit if credit else "0.00",
+                            "balance": balance,
+                            "page": page_idx + 1,
+                            "bank": "AmBank",
+                            "source_file": filename
+                        })
+                        
+    return transactions
