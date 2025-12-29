@@ -35,7 +35,7 @@ Output Format:
 -------------
 Each transaction is a dictionary with:
     {
-        'date': 'DD/MM/YYYY',
+        'date': 'YYYY-MM-DD',           # ISO 8601 format (unambiguous for pandas)
         'description': 'Transaction description',
         'debit': float,
         'credit': float,
@@ -249,14 +249,15 @@ def parse_transaction_details(day, month, rest_of_line, lines, page_num, filenam
         if year_match:
             year = year_match.group(1)
     
-    # Convert date to standard format
+    # Convert date to YYYY-MM-DD format (ISO 8601)
+    # This format is unambiguous and pandas will always parse correctly
     month_map = {
         'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
         'May': '05', 'Jun': '06', 'Jul': '07', 'Aug': '08',
         'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12'
     }
     
-    date_str = f"{day}/{month_map[month]}/{year}"
+    date_str = f"{year}-{month_map[month]}-{day}"
     
     # Extract all monetary amounts (format: 123,456.78 or 456.78)
     numbers = re.findall(r'[\d,]+\.\d{2}', rest_of_line)
@@ -347,8 +348,8 @@ def sort_transactions(transactions):
     """Sort transactions by date."""
     try:
         for tx in transactions:
-            # Parse date for sorting
-            tx['_date_obj'] = datetime.strptime(tx['date'], '%d/%m/%Y')
+            # Parse date for sorting (YYYY-MM-DD format)
+            tx['_date_obj'] = datetime.strptime(tx['date'], '%Y-%m-%d')
         
         # Sort by date
         transactions = sorted(transactions, key=lambda x: x['_date_obj'])
