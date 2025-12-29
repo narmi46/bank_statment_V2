@@ -1,108 +1,162 @@
-# affin_bank.py
 import re
 import pdfplumber
+
 
 def _clean_amount(x: str):
     """Convert common money strings to float-like string, or None."""
     if x is None:
         return None
+
     x = x.strip()
     if not x:
         return None
 
-    # remove commas and spaces
     x = x.replace(",", "").replace(" ", "")
 
-    # handle parentheses as negative (optional)
     if x.startswith("(") and x.endswith(")"):
         x = "-" + x[1:-1]
 
-    # keep only valid numeric pattern
     if not re.fullmatch(r"-?\d+(\.\d{1,2})?", x):
         return None
 
     return x
 
 
+SUMMARY_DEBIT_RE = re.compile(
+    r"TOTAL DEBITS.*?([\d,]+\.\d{2})", re.IGNORECASE
+)
+
+SUMMARY_CREDIT_RE = re.compile(
+    r"TOTAL CREDITS.*?([\d,]+\.\d{2})", re.IGNORECASE
+)
+
+
+def _compare_or_mark(manual, summary):
+    """
+    If manual == summary -> return manual
+    If mismatch -> return '*summary'
+    """
+    if summary is None:
+        return manual
+
+    if round(manual, 2) == round(summary, 2):
+        return manual
+
+    return f"*{summary:.2f}"
+
+
 def parse_ambank(pdf_input, source_file: str = ""):
     """
-    Dummy Affin Bank parser.
+    AmBank statement parser.
 
-    Accepts either:
-      - a pdfplumber.PDF object, OR
-      - a file-like object / streamlit UploadedFile
+    Accepts:
+      - pdfplumber.PDF
+      - file-like object (e.g. Streamlit UploadedFile)
 
-    Returns list[dict] with keys:
-      date, description, debit, credit, balance, page, bank, source_file
+    Returns:
+      list[dict]
     """
 
-    bank_name = "Affin Bank"
+    bank_name = "AmBank"
     tx = []
 
-    # Regex tries to match a common statement row pattern:
-    # DATE  DESCRIPTION  DEBIT  CREDIT  BALANCE
-    #
-    # Supports:
-    # - DD/MM/YYYY or DD-MM-YYYY
-    # - or DD/MM (no year)
-    #
-    # This is intentionally permissive for a "dummy" parser.
-    row_re = re.compile(
-        r"(?P<date>\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<debit>\(?[\d,]+\.\d{2}\)?)?\s*"
-        r"(?P<credit>\(?[\d,]+\.\d{2}\)?)?\s*"
-        r"(?P<balance>\(?[\d,]+\.\d{2}\)?)\s*$"
-    )
+    summary_debit = None
+    summary_credit = None
+
+    # Example: 06Sep, 9Sep
+    date_re = re.compile(r"^(?P<date>\d{1,2}[A-Za-z]{3})\s+(?P<rest>.+)$")
+    amount_re = re.compile(r"\(?[\d,]+\.\d{2}\)?")
+
+    def flush_tx(buf, page_idx):
+        if not buf:
+            return
+
+        text = " ".join(buf["lines"])
+
+        amounts = amount_re.findall(text)
+        amounts = [_clean_amount(a) for a in amounts if _clean_amount(a)]
+
+        debit = credit = balance = None
+
+        if len(amounts) >= 2:
+            balance = amounts[-1]
+            main_amt = amounts[-2]
+
+            if "CR" in text or "CREDIT" in text:
+                credit = main_amt
+            else:
+                debit = main_amt
+
+        tx.append({
+            "date": buf["date"],
+            "description": text.strip(),
+            "debit": float(debit) if debit else 0.0,
+            "credit": float(credit) if credit else 0.0,
+            "balance": float(balance) if balance else None,
+            "page": page_idx,
+            "bank": bank_name,
+            "source_file": source_file or ""
+        })
 
     def parse_pdf(pdf):
+        nonlocal summary_debit, summary_credit
+
+        # ---------- SUMMARY EXTRACTION (PAGE 1) ----------
+        first_page_text = pdf.pages[0].extract_text() or ""
+
+        m = SUMMARY_DEBIT_RE.search(first_page_text)
+        if m:
+            summary_debit = float(_clean_amount(m.group(1)))
+
+        m = SUMMARY_CREDIT_RE.search(first_page_text)
+        if m:
+            summary_credit = float(_clean_amount(m.group(1)))
+
+        # ---------- TRANSACTION PARSING ----------
         for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+            current = None
+
             for ln in lines:
-                m = row_re.match(ln)
-                if not m:
-                    continue
+                m = date_re.match(ln)
+                if m:
+                    flush_tx(current, page_idx)
+                    current = {
+                        "date": m.group("date"),
+                        "lines": [m.group("rest")]
+                    }
+                elif current:
+                    current["lines"].append(ln)
 
-                date = m.group("date")
-                desc = (m.group("desc") or "").strip()
+            flush_tx(current, page_idx)
 
-                debit = _clean_amount(m.group("debit"))
-                credit = _clean_amount(m.group("credit"))
-                balance = _clean_amount(m.group("balance"))
-
-                # If both debit and credit are empty, skip (likely not a real txn line)
-                if (debit is None or debit == "") and (credit is None or credit == ""):
-                    continue
-
-                tx.append({
-                    "date": date,
-                    "description": desc,
-                    "debit": float(debit) if debit is not None else 0.0,
-                    "credit": float(credit) if credit is not None else 0.0,
-                    "balance": float(balance) if balance is not None else None,
-                    "page": page_idx,
-                    "bank": bank_name,
-                    "source_file": source_file or ""
-                })
-
-    # --- Open handling (UploadedFile vs pdfplumber.PDF) ---
+    # ---------- OPEN PDF ----------
     if hasattr(pdf_input, "pages"):
-        # pdfplumber PDF already
         parse_pdf(pdf_input)
-        return tx
+    else:
+        try:
+            pdf_input.seek(0)
+        except Exception:
+            pass
 
-    # Otherwise assume it's a file-like object (e.g., Streamlit UploadedFile)
-    try:
-        pdf_input.seek(0)
-    except Exception:
-        pass
+        try:
+            with pdfplumber.open(pdf_input) as pdf:
+                parse_pdf(pdf)
+        except Exception:
+            return []
 
-    try:
-        with pdfplumber.open(pdf_input) as pdf:
-            parse_pdf(pdf)
-    except Exception:
-        # Dummy parser: swallow errors and return empty
-        return []
+    # ---------- TOTAL VALIDATION ----------
+    manual_debit = round(sum(t["debit"] for t in tx), 2)
+    manual_credit = round(sum(t["credit"] for t in tx), 2)
+
+    final_debit = _compare_or_mark(manual_debit, summary_debit)
+    final_credit = _compare_or_mark(manual_credit, summary_credit)
+
+    # ---------- OPTION B: INJECT TOTALS ----------
+    for t in tx:
+        t["total_debit"] = final_debit
+        t["total_credit"] = final_credit
 
     return tx
