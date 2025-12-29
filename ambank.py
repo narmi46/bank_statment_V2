@@ -6,7 +6,7 @@ from datetime import datetime
 # Helpers
 # ---------------------------------------------------
 def _clean_amount(x: str):
-    if x is None:
+    if not x:
         return None
     x = x.strip().replace(",", "").replace(" ", "")
     if not x:
@@ -30,11 +30,23 @@ def _compare_or_mark(manual, summary):
 DATE_RE = re.compile(r"^(?P<date>\d{1,2}[A-Za-z]{3})\s+(?P<rest>.+)$")
 AMOUNT_RE = re.compile(r"\(?[\d,]+\.\d{2}\)?")
 
-SUMMARY_DEBIT_RE = re.compile(r"TOTAL DEBITS.*?([\d,]+\.\d{2})", re.IGNORECASE)
-SUMMARY_CREDIT_RE = re.compile(r"TOTAL CREDITS.*?([\d,]+\.\d{2})", re.IGNORECASE)
-
 STATEMENT_YEAR_RE = re.compile(
     r"STATEMENT DATE.*?\d{2}/\d{2}/(?P<year>\d{4})",
+    re.IGNORECASE
+)
+
+OPENING_BALANCE_RE = re.compile(
+    r"OPENING BALANCE.*?([\d,]+\.\d{2})",
+    re.IGNORECASE
+)
+
+SUMMARY_DEBIT_RE = re.compile(
+    r"TOTAL DEBITS.*?([\d,]+\.\d{2})",
+    re.IGNORECASE
+)
+
+SUMMARY_CREDIT_RE = re.compile(
+    r"TOTAL CREDITS.*?([\d,]+\.\d{2})",
     re.IGNORECASE
 )
 
@@ -43,9 +55,10 @@ STATEMENT_YEAR_RE = re.compile(
 # ---------------------------------------------------
 def parse_ambank(pdf_input, source_file: str = ""):
     """
-    AmBank statement parser (date-normalized).
-    Output date format: YYYY-MM-DD
-    Debit/Credit direction is determined by BALANCE delta.
+    AmBank statement parser.
+    - Opening balance from ACCOUNT SUMMARY only
+    - Debit/Credit via balance delta
+    - Output date format: YYYY-MM-DD
     """
 
     bank_name = "AmBank"
@@ -53,71 +66,38 @@ def parse_ambank(pdf_input, source_file: str = ""):
 
     summary_debit = None
     summary_credit = None
+    opening_balance = None
     statement_year = None
 
     def flush_tx(buf, page_idx, prev_balance):
-        """
-        Returns updated prev_balance.
-        """
         if not buf:
             return prev_balance
 
         text = " ".join(buf["lines"]).strip()
 
-        # Skip balance brought forward lines (they're not transactions)
+        # Skip Balance B/F rows completely (NOT a transaction)
         if re.search(r"\b(balance b/f|baki bawa ke hadapan)\b", text, re.IGNORECASE):
-            # Try to seed prev_balance from the line if present
-            amounts = AMOUNT_RE.findall(text)
-            amounts = [_clean_amount(a) for a in amounts if _clean_amount(a)]
-            if amounts:
-                try:
-                    prev_balance = float(amounts[-1])
-                except Exception:
-                    pass
             return prev_balance
 
         amounts = AMOUNT_RE.findall(text)
         amounts = [_clean_amount(a) for a in amounts if _clean_amount(a)]
 
-        debit = credit = None
-        balance = None
+        if not amounts:
+            return prev_balance
 
-        # Expect last amount to be running balance on AmBank transaction rows
-        if amounts:
-            try:
-                balance = float(amounts[-1])
-            except Exception:
-                balance = None
+        try:
+            balance = float(amounts[-1])
+        except Exception:
+            return prev_balance
 
-        # --- Use balance delta to decide debit vs credit ---
-        if balance is not None and prev_balance is not None:
+        debit = credit = 0.0
+
+        if prev_balance is not None:
             delta = round(balance - prev_balance, 2)
             if delta > 0:
                 credit = delta
-                debit = 0.0
             elif delta < 0:
                 debit = -delta
-                credit = 0.0
-            else:
-                debit = 0.0
-                credit = 0.0
-        else:
-            # Fallback (only if we can't compute delta)
-            # Try using "main amount" just like your old logic
-            if len(amounts) >= 2:
-                main_amt = _clean_amount(amounts[-2])
-                try:
-                    main_amt_f = float(main_amt)
-                except Exception:
-                    main_amt_f = None
-                if main_amt_f is not None:
-                    # If keywords suggest credit; else debit
-                    if "CR" in text or "CREDIT" in text:
-                        credit = main_amt_f
-                        debit = 0.0
-                    else:
-                        debit = main_amt_f
-                        credit = 0.0
 
         # ---- DATE NORMALIZATION ----
         try:
@@ -131,28 +111,29 @@ def parse_ambank(pdf_input, source_file: str = ""):
         tx.append({
             "date": normalized_date,
             "description": text,
-            "debit": float(debit) if debit is not None else 0.0,
-            "credit": float(credit) if credit is not None else 0.0,
-            "balance": float(balance) if balance is not None else None,
+            "debit": debit,
+            "credit": credit,
+            "balance": balance,
             "page": page_idx,
             "bank": bank_name,
             "source_file": source_file or ""
         })
 
-        # Update prev_balance for next row
-        if balance is not None:
-            prev_balance = balance
-        return prev_balance
+        return balance
 
     def parse_pdf(pdf):
-        nonlocal summary_debit, summary_credit, statement_year
+        nonlocal summary_debit, summary_credit, opening_balance, statement_year
 
-        # ---------- FIRST PAGE (SUMMARY + YEAR) ----------
+        # ---------- FIRST PAGE (ACCOUNT SUMMARY) ----------
         first_page_text = pdf.pages[0].extract_text() or ""
 
         m = STATEMENT_YEAR_RE.search(first_page_text)
         if m:
             statement_year = int(m.group("year"))
+
+        m = OPENING_BALANCE_RE.search(first_page_text)
+        if m:
+            opening_balance = float(_clean_amount(m.group(1)))
 
         m = SUMMARY_DEBIT_RE.search(first_page_text)
         if m:
@@ -163,7 +144,7 @@ def parse_ambank(pdf_input, source_file: str = ""):
             summary_credit = float(_clean_amount(m.group(1)))
 
         # ---------- TRANSACTIONS ----------
-        prev_balance = None
+        prev_balance = opening_balance
 
         for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
@@ -175,13 +156,16 @@ def parse_ambank(pdf_input, source_file: str = ""):
                 m = DATE_RE.match(ln)
                 if m:
                     prev_balance = flush_tx(current, page_idx, prev_balance)
-                    current = {"date": m.group("date"), "lines": [m.group("rest")]}
+                    current = {
+                        "date": m.group("date"),
+                        "lines": [m.group("rest")]
+                    }
                 elif current:
                     current["lines"].append(ln)
 
             prev_balance = flush_tx(current, page_idx, prev_balance)
 
-    # ---------- OPEN HANDLING ----------
+    # ---------- OPEN PDF ----------
     if hasattr(pdf_input, "pages"):
         parse_pdf(pdf_input)
     else:
@@ -189,7 +173,6 @@ def parse_ambank(pdf_input, source_file: str = ""):
             pdf_input.seek(0)
         except Exception:
             pass
-
         try:
             with pdfplumber.open(pdf_input) as pdf:
                 parse_pdf(pdf)
@@ -203,7 +186,6 @@ def parse_ambank(pdf_input, source_file: str = ""):
     final_debit = _compare_or_mark(manual_debit, summary_debit)
     final_credit = _compare_or_mark(manual_credit, summary_credit)
 
-    # ---------- INJECT TOTALS ----------
     for t in tx:
         t["total_debit"] = final_debit
         t["total_credit"] = final_credit
