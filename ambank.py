@@ -1,8 +1,45 @@
+import re
+import pdfplumber
+from datetime import datetime
+
+# ---------------------------------------------------
+# Helpers
+# ---------------------------------------------------
+def _clean_amount(x: str):
+    if x is None:
+        return None
+    x = x.strip().replace(",", "").replace(" ", "")
+    if not x:
+        return None
+    if x.startswith("(") and x.endswith(")"):
+        x = "-" + x[1:-1]
+    if not re.fullmatch(r"-?\d+(\.\d{1,2})?", x):
+        return None
+    return x
+
+# ---------------------------------------------------
+# Regex (MODULE LEVEL!)
+# ---------------------------------------------------
+DATE_RE = re.compile(r"^(?P<date>\d{1,2}[A-Za-z]{3})\s+(?P<rest>.+)$")
+AMOUNT_RE = re.compile(r"\(?[\d,]+\.\d{2}\)?")
+
+SUMMARY_DEBIT_RE = re.compile(r"TOTAL DEBITS.*?([\d,]+\.\d{2})", re.IGNORECASE)
+SUMMARY_CREDIT_RE = re.compile(r"TOTAL CREDITS.*?([\d,]+\.\d{2})", re.IGNORECASE)
+
+# More robust for your PDF: "STATEMENT DATE : 01/03/2024 - 31/03/2024"
+STATEMENT_YEAR_RE = re.compile(
+    r"STATEMENT DATE.*?(\d{2})/(\d{2})/(?P<year>\d{4})",
+    re.IGNORECASE
+)
+
+# ---------------------------------------------------
+# Main Parser
+# ---------------------------------------------------
 def parse_ambank(pdf_input, source_file: str = ""):
     """
     AmBank statement parser.
     Uses statement SUMMARY totals as source of truth.
-    Compatible with app.py (returns list of transactions).
+    Returns list[dict] compatible with app.py :contentReference[oaicite:1]{index=1}
     """
 
     bank_name = "AmBank"
@@ -58,13 +95,14 @@ def parse_ambank(pdf_input, source_file: str = ""):
     def parse_pdf(pdf):
         nonlocal summary_debit, summary_credit, statement_year
 
-        # ---------- FIRST PAGE (SUMMARY) ----------
         first_page_text = pdf.pages[0].extract_text() or ""
 
+        # Year (from statement date range on page 1)
         m = STATEMENT_YEAR_RE.search(first_page_text)
         if m:
             statement_year = int(m.group("year"))
 
+        # Summary totals on page 1
         m = SUMMARY_DEBIT_RE.search(first_page_text)
         if m:
             summary_debit = float(_clean_amount(m.group(1)))
@@ -73,27 +111,23 @@ def parse_ambank(pdf_input, source_file: str = ""):
         if m:
             summary_credit = float(_clean_amount(m.group(1)))
 
-        # ---------- TRANSACTIONS ----------
+        # Transactions
         for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
             current = None
-
             for ln in lines:
                 m = DATE_RE.match(ln)
                 if m:
                     flush_tx(current, page_idx)
-                    current = {
-                        "date": m.group("date"),
-                        "lines": [m.group("rest")]
-                    }
+                    current = {"date": m.group("date"), "lines": [m.group("rest")]}
                 elif current:
                     current["lines"].append(ln)
 
             flush_tx(current, page_idx)
 
-    # ---------- OPEN PDF ----------
+    # Open handling
     if hasattr(pdf_input, "pages"):
         parse_pdf(pdf_input)
     else:
@@ -101,14 +135,13 @@ def parse_ambank(pdf_input, source_file: str = ""):
             pdf_input.seek(0)
         except Exception:
             pass
-
         try:
             with pdfplumber.open(pdf_input) as pdf:
                 parse_pdf(pdf)
         except Exception:
             return []
 
-    # ---------- INJECT SUMMARY TOTALS (SOURCE OF TRUTH) ----------
+    # Inject summary totals (source of truth)
     for t in tx:
         t["total_debit"] = summary_debit
         t["total_credit"] = summary_credit
