@@ -180,10 +180,33 @@ def parse_transaction_details(day, month, rest, page_num, filename, statement_in
 
     date_str = f"{year}-{month_map[month]}-{day}"
 
-    # Monetary values
-    numbers = re.findall(r'[\d,]+\.\d{2}', rest)
+    # -----------------------------------------------------------------
+    # ✅ BALANCE PARSING (supports DR/CR suffix at end of line)
+    # Example: "11,538.71DR" or "11,538.71 DR"
+    # DR => negative balance (overdraft)
+    # CR/None => positive balance
+    # -----------------------------------------------------------------
+    balance = None
+    suffix = None
 
-    description = rest
+    balance_match = re.search(r'([\d,]+\.\d{2})\s*(DR|CR)?\s*$', rest, re.IGNORECASE)
+    if balance_match:
+        bal_str = balance_match.group(1)
+        suffix = (balance_match.group(2) or "").upper()
+
+        balance = float(bal_str.replace(',', ''))
+        if suffix == "DR":
+            balance = -balance  # ✅ overdraft
+
+        # remove the trailing balance chunk from rest before extracting amounts/description
+        rest_wo_balance = rest[:balance_match.start()].strip()
+    else:
+        rest_wo_balance = rest.strip()
+
+    # Monetary values in the remaining part (typically debit/credit amounts)
+    numbers = re.findall(r'[\d,]+\.\d{2}', rest_wo_balance)
+
+    description = rest_wo_balance
     for n in numbers:
         description = description.replace(n, '')
 
@@ -197,10 +220,6 @@ def parse_transaction_details(day, month, rest, page_num, filename, statement_in
     description = re.sub(r',+\s*,+', ',', description)
     description = re.sub(r',\s*$', '', description)
     description = description.strip()
-
-    balance = None
-    if numbers:
-        balance = float(numbers[-1].replace(',', ''))
 
     tx = {
         'date': date_str,
@@ -217,6 +236,7 @@ def parse_transaction_details(day, month, rest, page_num, filename, statement_in
         tx['cheque_no'] = cheque_no
 
     return tx
+
 
 
 # ---------------------------------------------------------------------
