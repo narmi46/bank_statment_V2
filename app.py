@@ -187,7 +187,8 @@ def calculate_monthly_summary(transactions):
 
     df = pd.DataFrame(transactions)
 
-    df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
+    df['date_parsed'] = pd.to_datetime(df['date'], format='%d/%m/%Y', errors='coerce')
+    #df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
     df = df.dropna(subset=['date_parsed'])
 
     if df.empty:
