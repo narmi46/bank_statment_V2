@@ -2,183 +2,110 @@ import re
 import pdfplumber
 from datetime import datetime
 
-
 # ---------------------------------------------------
 # Helpers
 # ---------------------------------------------------
 def _clean_amount(x: str):
     if x is None:
         return None
-
-    x = x.strip().replace(",", "").replace(" ", "")
+    # Remove commas, currency symbols, and spaces
+    x = x.strip().replace(",", "").replace(" ", "").replace("MYR", "")
     if not x:
         return None
-
+    # Handle negative amounts in parentheses
     if x.startswith("(") and x.endswith(")"):
         x = "-" + x[1:-1]
-
-    if not re.fullmatch(r"-?\d+(\.\d{1,2})?", x):
+    # Validate it is a valid decimal number
+    try:
+        float(x)
+        return x
+    except ValueError:
         return None
 
-    return x
-
-
-def _compare_or_mark(manual, summary):
-    """
-    If manual == summary → return manual
-    If mismatch → return '*summary'
-    """
-    if summary is None:
-        return manual
-
-    if round(manual, 2) == round(summary, 2):
-        return manual
-
-    return f"*{summary:.2f}"
-
-
 # ---------------------------------------------------
-# Regex
+# Regex for Summary Data
 # ---------------------------------------------------
-DATE_RE = re.compile(r"^(?P<date>\d{1,2}[A-Za-z]{3})\s+(?P<rest>.+)$")
-AMOUNT_RE = re.compile(r"\(?[\d,]+\.\d{2}\)?")
-
-SUMMARY_DEBIT_RE = re.compile(
-    r"TOTAL DEBITS.*?([\d,]+\.\d{2})", re.IGNORECASE
-)
-
-SUMMARY_CREDIT_RE = re.compile(
-    r"TOTAL CREDITS.*?([\d,]+\.\d{2})", re.IGNORECASE
-)
-
-STATEMENT_YEAR_RE = re.compile(
-    r"STATEMENT DATE.*?\d{2}/\d{2}/(?P<year>\d{4})",
-    re.IGNORECASE
-)
-
+SUMMARY_DEBIT_RE = re.compile(r"TOTAL DEBITS.*?([\d,]+\.\d{2})", re.IGNORECASE)
+SUMMARY_CREDIT_RE = re.compile(r"TOTAL CREDITS.*?([\d,]+\.\d{2})", re.IGNORECASE)
+STATEMENT_YEAR_RE = re.compile(r"STATEMENT DATE.*?\d{2}/\d{2}/(?P<year>\d{4})", re.IGNORECASE)
 
 # ---------------------------------------------------
 # Main Parser
 # ---------------------------------------------------
 def parse_ambank(pdf_input, source_file: str = ""):
-    """
-    AmBank statement parser (date-normalized).
-
-    Output date format: YYYY-MM-DD
-    Fully compatible with app.py
-    """
-
     bank_name = "AmBank"
-    tx = []
-
+    all_transactions = []
+    
     summary_debit = None
     summary_credit = None
     statement_year = None
 
-    def flush_tx(buf, page_idx):
-        if not buf:
-            return
-
-        text = " ".join(buf["lines"])
-
-        amounts = AMOUNT_RE.findall(text)
-        amounts = [_clean_amount(a) for a in amounts if _clean_amount(a)]
-
-        debit = credit = balance = None
-
-        if len(amounts) >= 2:
-            balance = amounts[-1]
-            main_amt = amounts[-2]
-
-            if "CR" in text or "CREDIT" in text:
-                credit = main_amt
-            else:
-                debit = main_amt
-
-        # ---- DATE NORMALIZATION ----
-        try:
-            normalized_date = datetime.strptime(
-                f"{buf['date']}{statement_year}",
-                "%d%b%Y"
-            ).strftime("%Y-%m-%d")
-        except Exception:
-            normalized_date = buf["date"]  # fallback (won't crash)
-
-        tx.append({
-            "date": normalized_date,
-            "description": text.strip(),
-            "debit": float(debit) if debit else 0.0,
-            "credit": float(credit) if credit else 0.0,
-            "balance": float(balance) if balance else None,
-            "page": page_idx,
-            "bank": bank_name,
-            "source_file": source_file or ""
-        })
-
-    def parse_pdf(pdf):
-        nonlocal summary_debit, summary_credit, statement_year
-
-        # ---------- FIRST PAGE (SUMMARY + YEAR) ----------
+    with pdfplumber.open(pdf_input) as pdf:
+        # 1. Extract Metadata from First Page
         first_page_text = pdf.pages[0].extract_text() or ""
+        year_match = STATEMENT_YEAR_RE.search(first_page_text)
+        if year_match:
+            statement_year = year_match.group("year")
+        
+        # 2. Extract Official Summary for Validation
+        deb_match = SUMMARY_DEBIT_RE.search(first_page_text)
+        if deb_match:
+            summary_debit = float(_clean_amount(deb_match.group(1)))
+        
+        cred_match = SUMMARY_CREDIT_RE.search(first_page_text)
+        if cred_match:
+            summary_credit = float(_clean_amount(cred_match.group(1)))
 
-        m = STATEMENT_YEAR_RE.search(first_page_text)
-        if m:
-            statement_year = int(m.group("year"))
-
-        m = SUMMARY_DEBIT_RE.search(first_page_text)
-        if m:
-            summary_debit = float(_clean_amount(m.group(1)))
-
-        m = SUMMARY_CREDIT_RE.search(first_page_text)
-        if m:
-            summary_credit = float(_clean_amount(m.group(1)))
-
-        # ---------- TRANSACTIONS ----------
+        # 3. Process All Pages Using Table Extraction
         for page_idx, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            # AmBank statements typically have clear horizontal/vertical lines
+            tables = page.extract_tables()
+            
+            for table in tables:
+                for row in table:
+                    # Filter for rows that start with a date (e.g., "01 Mar")
+                    if not row or not row[0]:
+                        continue
+                        
+                    date_str = row[0].strip()
+                    # Match "DD Mon" format
+                    if not re.match(r"^\d{1,2}\s?[A-Za-z]{3}$", date_str):
+                        continue
+                    
+                    # Normalize Date
+                    try:
+                        clean_date = date_str.replace(" ", "")
+                        normalized_date = datetime.strptime(
+                            f"{clean_date}{statement_year}", "%d%b%Y"
+                        ).strftime("%Y-%m-%d")
+                    except:
+                        normalized_date = date_str
 
-            current = None
+                    # Column mapping based on AmBank layout:
+                    # 0: Date, 1: Transaction, 2: Cheque No, 3: Debit, 4: Credit, 5: Balance
+                    description = row[1].replace("\n", " ") if row[1] else ""
+                    debit_val = _clean_amount(row[3]) if len(row) > 3 else None
+                    credit_val = _clean_amount(row[4]) if len(row) > 4 else None
+                    balance_val = _clean_amount(row[5]) if len(row) > 5 else None
 
-            for ln in lines:
-                m = DATE_RE.match(ln)
-                if m:
-                    flush_tx(current, page_idx)
-                    current = {
-                        "date": m.group("date"),
-                        "lines": [m.group("rest")]
-                    }
-                elif current:
-                    current["lines"].append(ln)
+                    all_transactions.append({
+                        "date": normalized_date,
+                        "description": description.strip(),
+                        "debit": float(debit_val) if debit_val else 0.0,
+                        "credit": float(credit_val) if credit_val else 0.0,
+                        "balance": float(balance_val) if balance_val else None,
+                        "page": page_idx,
+                        "bank": bank_name,
+                        "source_file": source_file
+                    })
 
-            flush_tx(current, page_idx)
+    # 4. Final Validation
+    calc_debit = round(sum(t["debit"] for t in all_transactions), 2)
+    calc_credit = round(sum(t["credit"] for t in all_transactions), 2)
 
-    # ---------- OPEN HANDLING ----------
-    if hasattr(pdf_input, "pages"):
-        parse_pdf(pdf_input)
-    else:
-        try:
-            pdf_input.seek(0)
-        except Exception:
-            pass
+    # Output verification to console
+    print(f"Extraction Complete for {source_file}")
+    print(f"Calculated Debit: {calc_debit} | Statement Summary: {summary_debit}")
+    print(f"Calculated Credit: {calc_credit} | Statement Summary: {summary_credit}")
 
-        try:
-            with pdfplumber.open(pdf_input) as pdf:
-                parse_pdf(pdf)
-        except Exception:
-            return []
-
-    # ---------- TOTAL VALIDATION ----------
-    manual_debit = round(sum(t["debit"] for t in tx), 2)
-    manual_credit = round(sum(t["credit"] for t in tx), 2)
-
-    final_debit = _compare_or_mark(manual_debit, summary_debit)
-    final_credit = _compare_or_mark(manual_credit, summary_credit)
-
-    # ---------- OPTION B: INJECT TOTALS ----------
-    for t in tx:
-        t["total_debit"] = final_debit
-        t["total_credit"] = final_credit
-
-    return tx
-    
+    return all_transactions
