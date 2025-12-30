@@ -37,6 +37,11 @@ def extract_year_from_text(text):
         year = int(match.group(1))
         if 2000 <= year <= 2100:
             return str(year)
+
+    # Pattern 5: By gemini
+    match = re.search(r'(?:Statement Date|Tarikh Penyata)[:\s]*\d{1,2}\s+[a-z]{3}\s+(\d{4})', text, re.IGNORECASE)
+        if match:
+            return match.group(1)
     
     return None
 
