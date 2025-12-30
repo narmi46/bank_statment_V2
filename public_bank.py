@@ -7,43 +7,76 @@ import re
 
 def extract_year_from_text(text):
     """
-    Extract year from Public Bank statement.
-    Handles both 4-digit (2024) and 2-digit (24) year formats.
+    Extract year from Public Bank / Public Islamic Bank statement text.
+    Safely handles:
+    - Statement Date 31 Jul 2024
+    - STATEMENT DATE : 30/09/24
+    - Statement Date: DD/MM/YYYY
+    - FOR THE PERIOD : DD/MM/YYYY
     """
-    # Try specific patterns first (most reliable)
-    
-    # Pattern 1: STATEMENT DATE : 30/09/24 (capture only the year part)
-    match = re.search(r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})', text, re.IGNORECASE)
-    if match:
-        year_str = match.group(1)
-        if len(year_str) == 4:
-            return year_str
-        elif len(year_str) == 2:
-            return str(2000 + int(year_str))
-    
-    # Pattern 2: Statement Date: DD/MM/YYYY
-    match = re.search(r'Statement\s+(?:Date|Period)[:\s]+\d{1,2}/\d{1,2}/(\d{4})', text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    # Pattern 3: FOR THE PERIOD : DD/MM/YYYY
-    match = re.search(r'FOR\s+THE\s+PERIOD[:\s]+\d{1,2}/\d{1,2}/(\d{4})', text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    # Pattern 4: YYYY Statement
-    match = re.search(r'(\d{4})\s+Statement', text, re.IGNORECASE)
+
+    # -------------------------------------------------
+    # Pattern 1: Statement Date 31 Jul 2024 (MOST COMMON)
+    # -------------------------------------------------
+    match = re.search(
+        r'(?:Statement Date|Tarikh Penyata)\s*[:\s]+\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})',
+        text,
+        re.IGNORECASE
+    )
     if match:
         year = int(match.group(1))
         if 2000 <= year <= 2100:
             return str(year)
 
-    # Pattern 5: By gemini
-    match = re.search(r'(?:Statement Date|Tarikh Penyata)[:\s]*\d{1,2}\s+[a-z]{3}\s+(\d{4})', text, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    
+    # -------------------------------------------------
+    # Pattern 2: STATEMENT DATE : 30/09/24 or 30/09/2024
+    # -------------------------------------------------
+    match = re.search(
+        r'(?:STATEMENT DATE|TARIKH PENYATA)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{2,4})',
+        text,
+        re.IGNORECASE
+    )
+    if match:
+        year_str = match.group(1)
+        if len(year_str) == 4:
+            year = int(year_str)
+        else:
+            year = 2000 + int(year_str)
+
+        if 2000 <= year <= 2100:
+            return str(year)
+
+    # -------------------------------------------------
+    # Pattern 3: Statement Date: DD/MM/YYYY
+    # -------------------------------------------------
+    match = re.search(
+        r'Statement\s+(?:Date|Period)\s*[:\s]+\d{1,2}/\d{1,2}/(\d{4})',
+        text,
+        re.IGNORECASE
+    )
+    if match:
+        year = int(match.group(1))
+        if 2000 <= year <= 2100:
+            return str(year)
+
+    # -------------------------------------------------
+    # Pattern 4: FOR THE PERIOD : DD/MM/YYYY
+    # -------------------------------------------------
+    match = re.search(
+        r'FOR\s+THE\s+PERIOD\s*[:\s]+\d{1,2}/\d{1,2}/(\d{4})',
+        text,
+        re.IGNORECASE
+    )
+    if match:
+        year = int(match.group(1))
+        if 2000 <= year <= 2100:
+            return str(year)
+
+    # -------------------------------------------------
+    # No safe year found
+    # -------------------------------------------------
     return None
+
 
 
 # ---------------------------------------------------------
